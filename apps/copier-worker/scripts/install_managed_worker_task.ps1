@@ -285,7 +285,7 @@ do {
         Where-Object {
             $_.ExecutablePath -and
             [string]::Equals([IO.Path]::GetFullPath($_.ExecutablePath), $workerBinaryFullPath, [StringComparison]::OrdinalIgnoreCase) -and
-            $_.CommandLine -and $_.CommandLine.Contains($workerConfigFullPath)
+            $_.CommandLine -and $_.CommandLine.IndexOf($workerConfigFullPath, [StringComparison]::OrdinalIgnoreCase) -ge 0
         } | Select-Object -First 1
     if ($workerProcess) { break }
     if ([DateTime]::UtcNow -ge $startDeadline) { break }
@@ -295,10 +295,18 @@ do {
 if (-not $workerProcess) {
     $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName
     $recentError = if (Test-Path -LiteralPath $taskErrorLog -PathType Leaf) {
-        (Get-Content -LiteralPath $taskErrorLog -Tail 12 -ErrorAction SilentlyContinue) -join "`n"
+        $errorHead = (Get-Content -LiteralPath $taskErrorLog -TotalCount 12 -ErrorAction SilentlyContinue) -join "`n"
+        $errorTail = (Get-Content -LiteralPath $taskErrorLog -Tail 24 -ErrorAction SilentlyContinue) -join "`n"
+        "Log awal:`n$errorHead`nLog akhir:`n$errorTail"
     } else {
         "(log startup belum dibuat)"
     }
-    throw "Worker process tidak muncul setelah 45 detik (task state $($task.State), result $($taskInfo.LastTaskResult)). Log startup: $taskErrorLog`n$recentError"
+    $workerLog = Join-Path $taskLogDirectory "managed_worker.log"
+    $recentWorkerLog = if (Test-Path -LiteralPath $workerLog -PathType Leaf) {
+        (Get-Content -LiteralPath $workerLog -Tail 24 -ErrorAction SilentlyContinue) -join "`n"
+    } else {
+        "(log worker belum dibuat)"
+    }
+    throw "Worker process tidak muncul setelah 45 detik (task state $($task.State), result $($taskInfo.LastTaskResult)). Log startup: $taskErrorLog`n$recentError`nLog worker: $workerLog`n$recentWorkerLog"
 }
 Write-Output "Scheduled task '$taskName' dibuat dan dimulai untuk $resolvedRoot"
