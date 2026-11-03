@@ -145,7 +145,20 @@ async function getHealth(): Promise<Health> {
   return inflight;
 }
 
+const SESSION_COOKIES = [
+  "alg_admin_session",
+  "alg_client_session",
+  "__Host-alg_admin_session",
+  "__Host-alg_client_session",
+];
+
 export async function middleware(request: NextRequest): Promise<Response> {
+  const { pathname } = request.nextUrl;
+  if (pathname === "/dashboard" || pathname.startsWith("/dashboard/")) {
+    const hasSession = SESSION_COOKIES.some((name) => request.cookies.get(name)?.value);
+    if (!hasSession) return NextResponse.redirect(new URL("/admin/login", request.url));
+  }
+
   const isDocument =
     request.method === "GET" &&
     request.headers.get("sec-fetch-dest") === "document" &&
