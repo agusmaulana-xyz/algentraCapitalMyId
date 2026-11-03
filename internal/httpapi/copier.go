@@ -47,6 +47,7 @@ type copierJob struct {
 	CustomEAUpdatedAt string            `json:"custom_ea_updated_at"`
 	CustomEAParams    map[string]string `json:"custom_ea_params"`
 	CustomEAPaused    bool              `json:"custom_ea_paused"`
+	CustomEAInputsKnown bool            `json:"custom_ea_inputs_known"`
 }
 
 type loginCheckJob struct {
@@ -139,7 +140,54 @@ func (api copierAPI) register(mux *http.ServeMux, prefix string) {
 	mux.HandleFunc("POST "+prefix+"/copier/jobs/{account_id}/login-check", api.reportLoginCheck)
 	mux.HandleFunc("POST "+prefix+"/copier/jobs/{account_id}/status", api.reportStatus)
 	mux.HandleFunc("POST "+prefix+"/copier/jobs/{account_id}/report", api.reportAccount)
+	mux.HandleFunc("POST "+prefix+"/copier/accounts/{account_id}/custom-ea/inputs", api.reportCustomEAInputs)
 	mux.HandleFunc("GET "+prefix+"/copier/accounts/{account_id}/custom-ea", api.customEA)
+}
+
+// reportCustomEAInputs stores the input list a worker read from a compiled EA.
+// Lists parsed from .mq5 source at upload time are never overwritten.
+func (api copierAPI) reportCustomEAInputs(w http.ResponseWriter, r *http.Request) {
+	if !api.requireWorker(w, r) {
+		return
+	}
+	noStore(w)
+	accountID, ok := pathAccountID(r)
+	if !ok {
+		writeError(w, http.StatusNotFound, "EA akun tidak ditemukan")
+		return
+	}
+	var payload struct {
+		Inputs []customEAInput `json:"inputs"`
+	}
+	if err := decodeJSON(w, r, &payload, 256<<10); err != nil || payload.Inputs == nil || len(payload.Inputs) > maxCustomEAParams {
+		writeError(w, http.StatusUnprocessableEntity, "Daftar parameter EA tidak valid")
+		return
+	}
+	for i := range payload.Inputs {
+		input := &payload.Inputs[i]
+		if !paramNamePattern.MatchString(input.Name) || len(input.Default) > maxCustomEAParamValue || strings.ContainsAny(input.Default, "\x00\r\n") {
+			writeError(w, http.StatusUnprocessableEntity, "Daftar parameter EA tidak valid")
+			return
+		}
+		switch input.Type {
+		case "bool", "int", "double", "string":
+		default:
+			input.Type = "string"
+		}
+		input.Comment = ""
+	}
+	encoded, err := json.Marshal(payload.Inputs)
+	if err != nil {
+		writeError(w, http.StatusUnprocessableEntity, "Daftar parameter EA tidak valid")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	if _, err := api.pool.Exec(ctx, `UPDATE mt5_accounts SET custom_ea_inputs=$2 WHERE id=$1 AND ea_mode='CUSTOM' AND custom_ea_inputs IS NULL`, accountID, string(encoded)); err != nil {
+		writeError(w, http.StatusServiceUnavailable, "Daftar parameter EA tidak dapat disimpan")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 func (api copierAPI) customEA(w http.ResponseWriter, r *http.Request) {
@@ -298,7 +346,7 @@ func (api copierAPI) jobs(w http.ResponseWriter, r *http.Request) {
 		SELECT a.id, a.label, a.login, a.server, p.password_ciphertext, p.follower_symbol,
 		       p.mode_lot, p.ratio_lot, p.lot_tetap, p.max_lot_per_order, p.max_lot_total,
 	       p.max_open_positions, COALESCE(a.ea_mode, 'SERVER'), COALESCE(a.custom_ea_name, ''),
-	       COALESCE(a.custom_ea_updated_at, ''), a.custom_ea_params, a.custom_ea_paused		FROM managed_copy_profiles AS p
+	       COALESCE(a.custom_ea_updated_at, ''), a.custom_ea_params, a.custom_ea_paused, a.custom_ea_inputs		FROM managed_copy_profiles AS p
 		JOIN mt5_accounts AS a ON a.id = p.account_id
 		WHERE (p.active = TRUE OR (a.ea_mode = 'CUSTOM' AND p.login_status = 'VALID'))
 		  AND a.execution_mode = 'MANAGED'
@@ -312,16 +360,17 @@ func (api copierAPI) jobs(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var job copierJob
 		var ciphertext string
-		var rawParams sql.NullString
+		var rawParams, rawInputs sql.NullString
 		if err := rows.Scan(&job.AccountID, &job.Label, &job.Login, &job.Server, &ciphertext,
 			&job.FollowerSymbol, &job.ModeLot, &job.RatioLot, &job.FixedLot, &job.MaxLotPerOrder,
-			&job.MaxLotTotal, &job.MaxOpenPositions, &job.EAMode, &job.CustomEAName, &job.CustomEAUpdatedAt, &rawParams, &job.CustomEAPaused); err != nil {
+			&job.MaxLotTotal, &job.MaxOpenPositions, &job.EAMode, &job.CustomEAName, &job.CustomEAUpdatedAt, &rawParams, &job.CustomEAPaused, &rawInputs); err != nil {
 			rows.Close()
 			writeError(w, http.StatusServiceUnavailable, "Worker gagal membaca job")
 			return
 		}
 		if job.EAMode == "CUSTOM" {
 			job.CustomEAParams = decodeStoredParams(rawParams)
+			job.CustomEAInputsKnown = rawInputs.Valid && rawInputs.String != ""
 		}
 		password, err := security.DecryptManagedCopyPassword(api.secret, ciphertext)
 		if err != nil {

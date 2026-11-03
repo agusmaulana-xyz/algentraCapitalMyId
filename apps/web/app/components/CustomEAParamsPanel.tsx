@@ -94,7 +94,7 @@ export function CustomEAParamsPanel({ accountId }: { accountId: string }) {
       )}
       {data?.free_form && (
         <div className="form-grid">
-          <p className="muted">File .ex5 tidak bisa dibaca daftar parameternya. Isi nama dan nilai parameter secara manual sesuai input EA.</p>
+          <p className="muted">Daftar parameter EA ini belum terdeteksi. Server membacanya otomatis dari terminal saat EA dijeda (sekitar 1–2 menit setelah upload); muat ulang halaman ini nanti. Anda juga bisa mengisi nama dan nilai parameter secara manual.</p>
           {rows.map((row, index) => (
             <div className="toolbar" key={index}>
               <input aria-label="Nama parameter" placeholder="NamaParameter" maxLength={64} value={row.name} onChange={(event) => { const name = event.currentTarget.value; setRows((current) => current.map((item, i) => (i === index ? { ...item, name } : item))); }} />
