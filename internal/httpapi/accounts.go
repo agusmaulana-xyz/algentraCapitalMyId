@@ -7,6 +7,7 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	dbstore "github.com/rnpproject/algentra-backend/internal/database"
 	"io"
@@ -39,6 +40,9 @@ func (api clientMT5API) register(mux *http.ServeMux) {
 		mux.HandleFunc("POST "+prefix+"/accounts", api.createAccount)
 		mux.HandleFunc("PUT "+prefix+"/accounts/{account_id}/ea-choice", api.setEAChoice)
 		mux.HandleFunc("POST "+prefix+"/accounts/{account_id}/custom-ea", api.uploadCustomEA)
+		mux.HandleFunc("GET "+prefix+"/accounts/{account_id}/custom-ea/params", api.customEAParams)
+		mux.HandleFunc("PUT "+prefix+"/accounts/{account_id}/custom-ea/params", api.customEAParams)
+		mux.HandleFunc("PUT "+prefix+"/accounts/{account_id}/custom-ea/paused", api.setCustomEAPaused)
 		mux.HandleFunc("POST "+prefix+"/accounts/{account_id}/rotate-token", api.rotateToken)
 		mux.HandleFunc("PUT "+prefix+"/accounts/{account_id}/active", api.setAccountActive)
 		mux.HandleFunc("PUT "+prefix+"/accounts/{account_id}", api.updateAccount)
@@ -218,7 +222,7 @@ func (api clientMT5API) listAccounts(w http.ResponseWriter, r *http.Request) {
 	masterOnline := hasSnapshot && latest.Account != nil && now.Sub(latest.ObservedAt) <= 20*time.Second && now.Sub(latest.Account.ObservedAt) <= 30*time.Second
 	rows, err := api.pool.Query(ctx, `
 		SELECT a.id, a.label, a.server, a.login, a.plan, a.execution_mode, a.active, a.last_seen_at, a.created_at,
-		       a.rental_expires_at, a.ea_mode, a.custom_ea_name,
+		       a.rental_expires_at, a.ea_mode, a.custom_ea_name, a.custom_ea_paused,
 		       s.balance, s.equity, s.floating_profit, s.currency, s.trade_mode, s.observed_at,
 		       s.terminal_trade_allowed, s.expert_trade_allowed,
 	       p.account_id, p.login_status, p.login_message, p.follower_symbol, p.active, p.status,
@@ -243,6 +247,7 @@ func (api clientMT5API) listAccounts(w http.ResponseWriter, r *http.Request) {
 		var lastSeen, createdAt, stateObserved sql.NullTime
 		var rentalExpires sql.NullTime
 		var eaMode, customEAName sql.NullString
+		var customEAPaused bool
 		var balance, equity, floating sql.NullFloat64
 		var currency, tradeMode sql.NullString
 		var terminalAllowed, expertAllowed sql.NullBool
@@ -253,7 +258,7 @@ func (api clientMT5API) listAccounts(w http.ResponseWriter, r *http.Request) {
 		var lotMode sql.NullString
 		var ratio, fixedLot, maxOrder, maxTotal sql.NullFloat64
 		var maxPositions sql.NullInt64
-		if err := rows.Scan(&id, &label, &server, &login, &plan, &mode, &active, &lastSeen, &createdAt, &rentalExpires, &eaMode, &customEAName,
+		if err := rows.Scan(&id, &label, &server, &login, &plan, &mode, &active, &lastSeen, &createdAt, &rentalExpires, &eaMode, &customEAName, &customEAPaused,
 			&balance, &equity, &floating, &currency, &tradeMode, &stateObserved, &terminalAllowed, &expertAllowed,
 			&profileID, &loginStatus, &loginMessage, &followerSymbol, &profileActive, &profileStatus,
 			&statusMessage, &profileSeen, &profileUpdated, &lotMode, &ratio, &fixedLot, &maxOrder, &maxTotal, &maxPositions); err != nil {
@@ -280,7 +285,7 @@ func (api clientMT5API) listAccounts(w http.ResponseWriter, r *http.Request) {
 			"id": id, "label": label, "server": server, "login": login, "plan": plan,
 			"execution_mode": mode, "role": "follower", "active": active,
 			"last_seen_at": nullableWIB(lastSeen, wib), "connection_status": connection,
-			"rental_expires_at": nullableWIB(rentalExpires, wib), "ea_mode": nullableString(eaMode), "custom_ea_name": nullableString(customEAName),
+			"rental_expires_at": nullableWIB(rentalExpires, wib), "ea_mode": nullableString(eaMode), "custom_ea_name": nullableString(customEAName), "custom_ea_paused": customEAPaused,
 			"balance": nullableFloat(balance), "equity": nullableFloat(equity), "floating_profit": nullableFloat(floating),
 			"currency": nullableString(currency), "trade_mode": nullableString(tradeMode),
 			"state_updated_at": nullableWIB(stateObserved, wib), "created_at": nullableWIB(createdAt, wib),
@@ -342,7 +347,7 @@ func (api clientMT5API) setEAChoice(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "Pilih EA yang disediakan server atau unggah EA sendiri.")
 		return
 	}
-	result, err := api.pool.Exec(ctx, `UPDATE mt5_accounts SET ea_mode='SERVER',custom_ea_name=NULL,custom_ea_data=NULL,custom_ea_updated_at=NULL WHERE id=$1 AND owner_id=$2`, accountID, ownerID)
+	result, err := api.pool.Exec(ctx, `UPDATE mt5_accounts SET ea_mode='SERVER',custom_ea_name=NULL,custom_ea_data=NULL,custom_ea_updated_at=NULL,custom_ea_inputs=NULL,custom_ea_params=NULL,custom_ea_paused=0 WHERE id=$1 AND owner_id=$2`, accountID, ownerID)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "Pilihan EA tidak dapat disimpan")
 		return
@@ -390,7 +395,13 @@ func (api clientMT5API) uploadCustomEA(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "File EA kosong, tidak dapat dibaca, atau melebihi batas 10 MB")
 		return
 	}
-	result, err := api.pool.Exec(ctx, `UPDATE mt5_accounts SET ea_mode='CUSTOM',custom_ea_name=$3,custom_ea_data=$4,custom_ea_updated_at=$5 WHERE id=$1 AND owner_id=$2`, accountID, ownerID, name, data, time.Now().UTC().Format(time.RFC3339Nano))
+	inputsJSON := sql.NullString{}
+	if ext == ".mq5" {
+		if encoded, err := json.Marshal(parseMQ5Inputs(data)); err == nil {
+			inputsJSON = sql.NullString{String: string(encoded), Valid: true}
+		}
+	}
+	result, err := api.pool.Exec(ctx, `UPDATE mt5_accounts SET ea_mode='CUSTOM',custom_ea_name=$3,custom_ea_data=$4,custom_ea_updated_at=$5,custom_ea_inputs=$6,custom_ea_params=NULL,custom_ea_paused=1 WHERE id=$1 AND owner_id=$2`, accountID, ownerID, name, data, time.Now().UTC().Format(time.RFC3339Nano), inputsJSON)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "File EA tidak dapat disimpan")
 		return

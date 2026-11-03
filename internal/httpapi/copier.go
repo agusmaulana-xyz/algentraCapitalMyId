@@ -30,21 +30,23 @@ type copierAPI struct {
 }
 
 type copierJob struct {
-	AccountID         int64   `json:"account_id"`
-	Label             string  `json:"label"`
-	Login             string  `json:"login"`
-	Server            string  `json:"server"`
-	BrokerPassword    string  `json:"broker_password"`
-	FollowerSymbol    string  `json:"follower_symbol"`
-	ModeLot           string  `json:"mode_lot"`
-	RatioLot          float64 `json:"ratio_lot"`
-	FixedLot          float64 `json:"lot_tetap"`
-	MaxLotPerOrder    float64 `json:"max_lot_per_order"`
-	MaxLotTotal       float64 `json:"max_lot_total"`
-	MaxOpenPositions  int     `json:"max_open_positions"`
-	EAMode            string  `json:"ea_mode"`
-	CustomEAName      string  `json:"custom_ea_name"`
-	CustomEAUpdatedAt string  `json:"custom_ea_updated_at"`
+	AccountID         int64             `json:"account_id"`
+	Label             string            `json:"label"`
+	Login             string            `json:"login"`
+	Server            string            `json:"server"`
+	BrokerPassword    string            `json:"broker_password"`
+	FollowerSymbol    string            `json:"follower_symbol"`
+	ModeLot           string            `json:"mode_lot"`
+	RatioLot          float64           `json:"ratio_lot"`
+	FixedLot          float64           `json:"lot_tetap"`
+	MaxLotPerOrder    float64           `json:"max_lot_per_order"`
+	MaxLotTotal       float64           `json:"max_lot_total"`
+	MaxOpenPositions  int               `json:"max_open_positions"`
+	EAMode            string            `json:"ea_mode"`
+	CustomEAName      string            `json:"custom_ea_name"`
+	CustomEAUpdatedAt string            `json:"custom_ea_updated_at"`
+	CustomEAParams    map[string]string `json:"custom_ea_params"`
+	CustomEAPaused    bool              `json:"custom_ea_paused"`
 }
 
 type loginCheckJob struct {
@@ -296,8 +298,7 @@ func (api copierAPI) jobs(w http.ResponseWriter, r *http.Request) {
 		SELECT a.id, a.label, a.login, a.server, p.password_ciphertext, p.follower_symbol,
 		       p.mode_lot, p.ratio_lot, p.lot_tetap, p.max_lot_per_order, p.max_lot_total,
 	       p.max_open_positions, COALESCE(a.ea_mode, 'SERVER'), COALESCE(a.custom_ea_name, ''),
-	       COALESCE(a.custom_ea_updated_at, '')
-		FROM managed_copy_profiles AS p
+	       COALESCE(a.custom_ea_updated_at, ''), a.custom_ea_params, a.custom_ea_paused		FROM managed_copy_profiles AS p
 		JOIN mt5_accounts AS a ON a.id = p.account_id
 		WHERE (p.active = TRUE OR (a.ea_mode = 'CUSTOM' AND p.login_status = 'VALID'))
 		  AND a.execution_mode = 'MANAGED'
@@ -311,12 +312,16 @@ func (api copierAPI) jobs(w http.ResponseWriter, r *http.Request) {
 	for rows.Next() {
 		var job copierJob
 		var ciphertext string
+		var rawParams sql.NullString
 		if err := rows.Scan(&job.AccountID, &job.Label, &job.Login, &job.Server, &ciphertext,
 			&job.FollowerSymbol, &job.ModeLot, &job.RatioLot, &job.FixedLot, &job.MaxLotPerOrder,
-			&job.MaxLotTotal, &job.MaxOpenPositions, &job.EAMode, &job.CustomEAName, &job.CustomEAUpdatedAt); err != nil {
+			&job.MaxLotTotal, &job.MaxOpenPositions, &job.EAMode, &job.CustomEAName, &job.CustomEAUpdatedAt, &rawParams, &job.CustomEAPaused); err != nil {
 			rows.Close()
 			writeError(w, http.StatusServiceUnavailable, "Worker gagal membaca job")
 			return
+		}
+		if job.EAMode == "CUSTOM" {
+			job.CustomEAParams = decodeStoredParams(rawParams)
 		}
 		password, err := security.DecryptManagedCopyPassword(api.secret, ciphertext)
 		if err != nil {

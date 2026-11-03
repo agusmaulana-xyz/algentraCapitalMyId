@@ -10,6 +10,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -149,6 +151,28 @@ func (w *worker) prepareManagedEA(j job, token, terminalDir, name string, report
 		return fmt.Errorf("preset EA akun %d tidak dapat ditulis: %w", j.AccountID, err)
 	}
 	return nil
+}
+
+var customParamName = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]{0,63}$`)
+
+// writeCustomPreset writes the user's input overrides as an MT5 .set preset.
+func writeCustomPreset(path string, params map[string]string) error {
+	names := make([]string, 0, len(params))
+	for name, value := range params {
+		if !customParamName.MatchString(name) || strings.ContainsAny(value, "\x00\r\n") {
+			return fmt.Errorf("parameter %q tidak valid", name)
+		}
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	var content strings.Builder
+	for _, name := range names {
+		content.WriteString(name + "=" + params[name] + "\r\n")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return err
+	}
+	return writeAtomic(path, []byte(content.String()))
 }
 
 func managedSymbolMap(followerSymbol string) string {

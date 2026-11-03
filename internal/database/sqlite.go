@@ -98,6 +98,9 @@ func ensureSchema(ctx context.Context, filename string) error {
 		{"mt5_accounts", "custom_ea_name", "VARCHAR(128)"},
 		{"mt5_accounts", "custom_ea_data", "BLOB"},
 		{"mt5_accounts", "custom_ea_updated_at", "TEXT"},
+		{"mt5_accounts", "custom_ea_inputs", "TEXT"},
+		{"mt5_accounts", "custom_ea_params", "TEXT"},
+		{"mt5_accounts", "custom_ea_paused", "INTEGER NOT NULL DEFAULT 0"},
 	} {
 		query := `ALTER TABLE ` + migration.table + ` ADD COLUMN ` + migration.column + ` ` + migration.definition
 		if _, err := db.ExecContext(ctx, query); err != nil && !strings.Contains(strings.ToLower(err.Error()), "duplicate column name") {

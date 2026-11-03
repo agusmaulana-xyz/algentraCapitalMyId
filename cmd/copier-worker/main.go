@@ -51,21 +51,23 @@ type config struct {
 }
 
 type job struct {
-	AccountID         int64   `json:"account_id"`
-	Label             string  `json:"label"`
-	Login             string  `json:"login"`
-	Server            string  `json:"server"`
-	BrokerPassword    string  `json:"broker_password"`
-	FollowerSymbol    string  `json:"follower_symbol"`
-	ModeLot           string  `json:"mode_lot"`
-	RatioLot          float64 `json:"ratio_lot"`
-	FixedLot          float64 `json:"lot_tetap"`
-	MaxLotPerOrder    float64 `json:"max_lot_per_order"`
-	MaxLotTotal       float64 `json:"max_lot_total"`
-	MaxOpenPositions  int     `json:"max_open_positions"`
-	EAMode            string  `json:"ea_mode"`
-	CustomEAName      string  `json:"custom_ea_name"`
-	CustomEAUpdatedAt string  `json:"custom_ea_updated_at"`
+	AccountID         int64             `json:"account_id"`
+	Label             string            `json:"label"`
+	Login             string            `json:"login"`
+	Server            string            `json:"server"`
+	BrokerPassword    string            `json:"broker_password"`
+	FollowerSymbol    string            `json:"follower_symbol"`
+	ModeLot           string            `json:"mode_lot"`
+	RatioLot          float64           `json:"ratio_lot"`
+	FixedLot          float64           `json:"lot_tetap"`
+	MaxLotPerOrder    float64           `json:"max_lot_per_order"`
+	MaxLotTotal       float64           `json:"max_lot_total"`
+	MaxOpenPositions  int               `json:"max_open_positions"`
+	EAMode            string            `json:"ea_mode"`
+	CustomEAName      string            `json:"custom_ea_name"`
+	CustomEAUpdatedAt string            `json:"custom_ea_updated_at"`
+	CustomEAParams    map[string]string `json:"custom_ea_params"`
+	CustomEAPaused    bool              `json:"custom_ea_paused"`
 }
 
 type loginCheck struct {
@@ -468,6 +470,7 @@ func (w *worker) launch(j job, now time.Time, reporter bool) error {
 	}
 	c := &child{accountID: j.AccountID, fingerprint: fingerprint(j), cmd: cmd, done: make(chan error, 1), stopped: make(chan struct{}), log: logFile, heartbeat: heartbeat, startedAt: now, executor: executor, feedToken: token, startupINI: configPath}
 	if reporter {
+		c.fingerprint = reporterFingerprint(j)
 		w.reporters[j.AccountID] = c
 	} else {
 		w.children[j.AccountID] = c
@@ -559,6 +562,12 @@ func (w *worker) makeJobConfig(j job, reporter bool) (string, string, string, er
 			return "", "", "", errors.New("format EA custom harus .mq5 atau .ex5")
 		}
 		expertName, presetName = "AlgentraCustom\\CustomEA", ""
+		if len(j.CustomEAParams) > 0 {
+			presetName = name + ".set"
+			if err := writeCustomPreset(filepath.Join(accountDir, "MQL5", "Presets", presetName), j.CustomEAParams); err != nil {
+				return "", "", "", fmt.Errorf("parameter EA custom akun %d tidak dapat ditulis: %w", j.AccountID, err)
+			}
+		}
 	} else if err := w.prepareManagedEA(j, token, accountDir, name, reporter); err != nil {
 		w.feed.Unregister(j.AccountID)
 		return "", "", "", err
@@ -672,9 +681,23 @@ func (w *worker) syncOnce() error {
 			continue
 		}
 		current := w.children[id]
+		if strings.EqualFold(j.EAMode, "CUSTOM") && j.CustomEAPaused {
+			// Paused custom EA: only the report-only terminal keeps running.
+			w.stopMainChild(id, false)
+			w.ensureReporter(j)
+			if w.reporters[id] != nil {
+				_ = w.report(id, "RUNNING", "EA kustom dijeda. Atur parameter lalu jalankan dari portal.")
+			} else {
+				_ = w.report(id, "STARTING", "")
+			}
+			continue
+		}
 		sum := fingerprint(j)
+		if !strings.EqualFold(j.EAMode, "CUSTOM") {
+			w.stopReporter(id)
+		}
 		if current != nil && current.fingerprint != sum {
-			w.stopChild(id, false)
+			w.stopMainChild(id, false)
 			current = nil
 		}
 		if current == nil {
@@ -693,7 +716,9 @@ func (w *worker) syncOnce() error {
 		select {
 		case err := <-current.done:
 			delete(w.children, id)
-			w.feed.Unregister(id)
+			if current.executor != "custom_ea" {
+				w.feed.Unregister(id)
+			}
 			w.failures[id]++
 			backoff := time.Duration(min(60, 1<<min(w.failures[id], 6))) * time.Second
 			w.retryAt[id] = time.Now().Add(backoff)
@@ -847,12 +872,19 @@ func (w *worker) report(id int64, status, message string) error {
 
 func (w *worker) stopChild(id int64, report bool) {
 	w.stopReporter(id)
+	w.stopMainChild(id, report)
+}
+
+func (w *worker) stopMainChild(id int64, report bool) {
 	c := w.children[id]
 	if c == nil {
 		return
 	}
 	delete(w.children, id)
-	w.feed.Unregister(id)
+	// A custom EA never registers with the feed; the id may belong to its reporter.
+	if c.executor != "custom_ea" {
+		w.feed.Unregister(id)
+	}
 	if c.startupINI != "" {
 		defer os.Remove(c.startupINI)
 	}
@@ -898,6 +930,10 @@ func (w *worker) shutdown() {
 // trades) alive next to a custom-EA terminal, so the portal keeps receiving
 // balance, equity and deal history for the account.
 func (w *worker) ensureReporter(j job) {
+	sum := reporterFingerprint(j)
+	if c := w.reporters[j.AccountID]; c != nil && c.fingerprint != sum {
+		w.stopReporter(j.AccountID)
+	}
 	if c := w.reporters[j.AccountID]; c != nil {
 		select {
 		case err := <-c.done:
@@ -969,6 +1005,12 @@ func (w *worker) removeOrphan(id int64) error {
 		_ = os.Remove(filepath.Join(w.cfg.runtimeDir, item[0], item[1]))
 	}
 	return nil
+}
+
+// reporterFingerprint only covers what the report-only terminal depends on, so
+// EA parameter or pause changes do not restart it.
+func reporterFingerprint(j job) string {
+	return fingerprint([]any{j.AccountID, j.Login, j.Server, j.BrokerPassword, j.FollowerSymbol})
 }
 
 func fingerprint(value any) string {
