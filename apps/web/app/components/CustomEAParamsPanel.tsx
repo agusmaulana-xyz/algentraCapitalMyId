@@ -72,15 +72,28 @@ export function CustomEAParamsPanel({ accountId }: { accountId: string }) {
   };
 
   return (
-    <section className="panel section">
-      <span className="eyebrow">EA sendiri</span>
-      <h2>Parameter EA{data?.custom_ea_name ? ` · ${data.custom_ea_name}` : ""}</h2>
-      <p className="muted">Kosongkan kolom untuk memakai nilai default EA. {data?.paused ? "EA sedang dijeda; simpan parameter lalu tekan Jalankan EA." : "Perubahan akan memulai ulang terminal akun ini."}</p>
+    <section className="panel section ea-params">
+      <header className="ea-params__head">
+        <span className="eyebrow">EA sendiri</span>
+        <h2>Parameter EA</h2>
+        {data?.custom_ea_name ? <p className="ea-params__file">{data.custom_ea_name}</p> : null}
+        {data ? (
+          <span className={`ea-params__state${data.paused ? " ea-params__state--paused" : ""}`}>
+            {data.paused ? "Dijeda" : "Berjalan"}
+          </span>
+        ) : null}
+      </header>
+      <p className="muted ea-params__hint">
+        Kosongkan kolom untuk memakai nilai default EA. {data?.paused ? "EA sedang dijeda; simpan parameter lalu tekan Jalankan EA." : "Perubahan akan memulai ulang terminal akun ini."}
+      </p>
       {data && !data.free_form && (
-        <div className="form-grid">
+        <div className="ea-params__grid">
           {data.inputs.map((input) => (
-            <label key={input.name}>
-              {input.name} <small className="muted">({input.type}{input.comment ? ` · ${input.comment}` : ""})</small>
+            <label key={input.name} className="ea-params__field">
+              <span className="ea-params__name">
+                {input.name}
+                <small>{input.type}{input.comment ? ` · ${input.comment}` : ""}</small>
+              </span>
               <input
                 value={values[input.name] ?? ""}
                 placeholder={input.default}
@@ -89,27 +102,26 @@ export function CustomEAParamsPanel({ accountId }: { accountId: string }) {
               />
             </label>
           ))}
-          {data.inputs.length === 0 && <p className="muted">EA ini tidak memiliki parameter input.</p>}
         </div>
       )}
       {data?.free_form && (
-        <div className="form-grid">
-          <p className="muted">Daftar parameter EA ini belum terdeteksi. Server membacanya otomatis dari terminal saat EA dijeda (sekitar 1–2 menit setelah upload); muat ulang halaman ini nanti. Anda juga bisa mengisi nama dan nilai parameter secara manual.</p>
+        <div className="ea-params__manual">
+          <p className="muted">Daftar parameter belum terdeteksi. Server membacanya otomatis dari terminal saat EA dijeda (sekitar 1–2 menit setelah upload); muat ulang halaman ini nanti. Anda juga bisa mengisi nama dan nilai secara manual.</p>
           {rows.map((row, index) => (
-            <div className="toolbar" key={index}>
+            <div className="ea-params__row" key={index}>
               <input aria-label="Nama parameter" placeholder="NamaParameter" maxLength={64} value={row.name} onChange={(event) => { const name = event.currentTarget.value; setRows((current) => current.map((item, i) => (i === index ? { ...item, name } : item))); }} />
               <input aria-label="Nilai parameter" placeholder="Nilai" maxLength={256} value={row.value} onChange={(event) => { const value = event.currentTarget.value; setRows((current) => current.map((item, i) => (i === index ? { ...item, value } : item))); }} />
               <button type="button" className="secondary" onClick={() => setRows((current) => current.filter((_, i) => i !== index))}>Hapus</button>
             </div>
           ))}
-          <button type="button" className="secondary" onClick={() => setRows((current) => [...current, { name: "", value: "" }])}>Tambah parameter</button>
+          <button type="button" className="secondary ea-params__add" onClick={() => setRows((current) => [...current, { name: "", value: "" }])}>+ Tambah parameter</button>
         </div>
       )}
-      <div className="toolbar">
+      <footer className="ea-params__actions">
         <button type="button" disabled={busy || !data} onClick={() => void save()}>{busy ? "Menyimpan…" : "Simpan parameter"}</button>
         {data ? <button type="button" className="secondary" disabled={busy} onClick={() => void setPaused(!data.paused)}>{data.paused ? "Jalankan EA" : "Pause EA"}</button> : null}
-        <a href="/account">Kembali ke akun</a>
-      </div>
+        <a className="ea-params__back" href="/account">← Kembali ke akun</a>
+      </footer>
       {message ? <p className="status" role="status">{message}</p> : null}
     </section>
   );

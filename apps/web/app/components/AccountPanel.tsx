@@ -664,30 +664,38 @@ function ManagedAccountCard({
           </button>
         )}
       </details>
-      <section className="account-ea-choice" aria-label="Pilihan Expert Advisor server">
-        <h4>EA server</h4>
-        <div className="toolbar">
-          <button type="button" className={account.ea_mode === "CUSTOM" ? "secondary" : ""} disabled={eaBusy} onClick={() => void handleServerEA()}>
-            Pakai EA server
-          </button>
-          <span>{account.ea_mode === "CUSTOM" ? `EA sendiri: ${account.custom_ea_name || "terpasang"}` : "EA server dipilih"}</span>
+      <section className="account-ea-choice" aria-label="Pilihan Expert Advisor">
+        <div className="account-ea-head">
+          <h4>Expert Advisor</h4>
+          <span className={`account-ea-badge${account.ea_mode === "CUSTOM" ? " account-ea-badge--custom" : ""}`}>
+            {account.ea_mode === "CUSTOM" ? "EA sendiri" : "EA server"}
+          </span>
         </div>
-        <label>
-          EA sendiri (.mq5 / .ex5, maks 10 MB)
-          <input type="file" accept=".mq5,.ex5,application/octet-stream,text/plain" onChange={(event) => setCustomEAFile(event.currentTarget.files?.[0] || null)} />
-        </label>
-        <button type="button" className="secondary" disabled={eaBusy || !customEAFile} onClick={() => void handleCustomEAUpload()}>
-          {eaBusy ? "Memproses…" : "Unggah EA sendiri"}
-        </button>
+        <p className="account-ea-note">
+          {account.ea_mode === "CUSTOM"
+            ? `${account.custom_ea_name || "EA terpasang"} · ${account.custom_ea_paused ? "dijeda, atur parameter lalu jalankan" : "berjalan"}`
+            : "Terminal sewa memakai EA bawaan server."}
+        </p>
         {account.ea_mode === "CUSTOM" ? (
-          <div className="toolbar">
+          <div className="account-ea-actions">
             <button type="button" disabled={eaBusy} onClick={() => void handleCustomEAPaused(!account.custom_ea_paused)}>
-              {account.custom_ea_paused ? "Jalankan EA sendiri" : "Pause EA sendiri"}
+              {account.custom_ea_paused ? "Jalankan EA" : "Pause EA"}
             </button>
-            <span>{account.custom_ea_paused ? "Dijeda — atur parameter dulu sebelum dijalankan" : "EA sendiri berjalan"}</span>
-            <a className="button secondary" href={`/account/ea-params?account=${account.id}`}>Atur parameter EA</a>
+            <a className="account-ea-link" href={`/account/ea-params?account=${account.id}`}>Atur parameter</a>
+            <button type="button" className="secondary" disabled={eaBusy} onClick={() => void handleServerEA()}>
+              Pakai EA server
+            </button>
           </div>
         ) : null}
+        <div className="account-ea-upload">
+          <label>
+            Unggah EA sendiri (.mq5 / .ex5, maks 10 MB)
+            <input type="file" accept=".mq5,.ex5,application/octet-stream,text/plain" onChange={(event) => setCustomEAFile(event.currentTarget.files?.[0] || null)} />
+          </label>
+          <button type="button" className="secondary" disabled={eaBusy || !customEAFile} onClick={() => void handleCustomEAUpload()}>
+            {eaBusy ? "Memproses…" : "Unggah"}
+          </button>
+        </div>
         {eaMessage ? <p className="status" role="status">{eaMessage}</p> : null}
       </section>
       <p className={loginClass} role="status" aria-live="polite">
