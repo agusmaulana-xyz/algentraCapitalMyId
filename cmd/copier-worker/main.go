@@ -100,6 +100,7 @@ type worker struct {
 	reporters     map[int64]*child
 	reporterRetry map[int64]time.Time
 	discoverRetry map[int64]time.Time
+	captureAttempts map[int64]int
 	retryAt       map[int64]time.Time
 	failures      map[int64]int
 	master        *exec.Cmd
@@ -266,7 +267,7 @@ func newWorker(cfg config) (*worker, error) {
 	transport.MaxConnsPerHost = 128
 	return &worker{
 		cfg: cfg, client: &http.Client{Timeout: 20 * time.Second, Transport: transport}, children: map[int64]*child{},
-		reporters: map[int64]*child{}, reporterRetry: map[int64]time.Time{}, discoverRetry: map[int64]time.Time{},
+		reporters: map[int64]*child{}, reporterRetry: map[int64]time.Time{}, discoverRetry: map[int64]time.Time{}, captureAttempts: map[int64]int{},
 		retryAt: map[int64]time.Time{}, failures: map[int64]int{}, stop: make(chan struct{}), checking: map[int64]bool{},
 		masterBinary: findMasterPublisher(cfg.projectRoot),
 		feed:         feed,
@@ -470,7 +471,7 @@ func (w *worker) launch(j job, now time.Time, reporter bool) error {
 	} else if strings.EqualFold(j.EAMode, "CUSTOM") {
 		executor = "custom_ea"
 	}
-	c := &child{accountID: j.AccountID, fingerprint: fingerprint(j), cmd: cmd, done: make(chan error, 1), stopped: make(chan struct{}), log: logFile, heartbeat: heartbeat, startedAt: now, executor: executor, feedToken: token, startupINI: configPath}
+	c := &child{accountID: j.AccountID, fingerprint: jobFingerprint(j), cmd: cmd, done: make(chan error, 1), stopped: make(chan struct{}), log: logFile, heartbeat: heartbeat, startedAt: now, executor: executor, feedToken: token, startupINI: configPath}
 	if reporter {
 		c.fingerprint = reporterFingerprint(j)
 		w.reporters[j.AccountID] = c
@@ -697,13 +698,16 @@ func (w *worker) syncOnce() error {
 			}
 			continue
 		}
-		sum := fingerprint(j)
+		sum := jobFingerprint(j)
 		if !strings.EqualFold(j.EAMode, "CUSTOM") {
 			w.stopReporter(id)
 		}
 		if current != nil && current.fingerprint != sum {
 			w.stopMainChild(id, false)
 			current = nil
+		}
+		if current != nil && current.executor == "custom_ea" && !j.CustomEAInputsKnown && w.captureRunningInputs(j, current) {
+			continue
 		}
 		if current == nil {
 			if time.Now().Before(w.retryAt[id]) {
@@ -1010,6 +1014,13 @@ func (w *worker) removeOrphan(id int64) error {
 		_ = os.Remove(filepath.Join(w.cfg.runtimeDir, item[0], item[1]))
 	}
 	return nil
+}
+
+// jobFingerprint ignores discovery bookkeeping so learning an EA's inputs does
+// not restart a running terminal.
+func jobFingerprint(j job) string {
+	j.CustomEAInputsKnown = false
+	return fingerprint(j)
 }
 
 // reporterFingerprint only covers what the report-only terminal depends on, so

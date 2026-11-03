@@ -17,6 +17,10 @@ func TestParseChartInputs(t *testing.T) {
 	if _, ok := parseChartInputs("<chart>\r\nsymbol=EURUSD\r\n</chart>"); ok {
 		t.Fatal("chart without expert accepted")
 	}
+	loose, ok := parseChartInputs("<expert>\r\nname=X\r\npath=Experts\\X.ex5\r\nexpertmode=33\r\nLots=0.5\r\nUseSL=false\r\n</expert>")
+	if !ok || len(loose) != 2 || loose[0].Name != "Lots" || loose[1].Type != "bool" {
+		t.Fatalf("loose inputs not parsed: %+v", loose)
+	}
 	if inputs, ok := parseChartInputs("<expert>\r\nname=X\r\n</expert>"); !ok || len(inputs) != 0 {
 		t.Fatal("expert without inputs should be an empty list")
 	}
