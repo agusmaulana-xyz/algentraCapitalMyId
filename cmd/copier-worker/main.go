@@ -68,6 +68,7 @@ type job struct {
 	CustomEAUpdatedAt string            `json:"custom_ea_updated_at"`
 	CustomEAParams    map[string]string `json:"custom_ea_params"`
 	CustomEAPaused    bool              `json:"custom_ea_paused"`
+	CustomEAInputsKnown bool            `json:"custom_ea_inputs_known"`
 }
 
 type loginCheck struct {
@@ -98,6 +99,7 @@ type worker struct {
 	children      map[int64]*child
 	reporters     map[int64]*child
 	reporterRetry map[int64]time.Time
+	discoverRetry map[int64]time.Time
 	retryAt       map[int64]time.Time
 	failures      map[int64]int
 	master        *exec.Cmd
@@ -264,7 +266,7 @@ func newWorker(cfg config) (*worker, error) {
 	transport.MaxConnsPerHost = 128
 	return &worker{
 		cfg: cfg, client: &http.Client{Timeout: 20 * time.Second, Transport: transport}, children: map[int64]*child{},
-		reporters: map[int64]*child{}, reporterRetry: map[int64]time.Time{},
+		reporters: map[int64]*child{}, reporterRetry: map[int64]time.Time{}, discoverRetry: map[int64]time.Time{},
 		retryAt: map[int64]time.Time{}, failures: map[int64]int{}, stop: make(chan struct{}), checking: map[int64]bool{},
 		masterBinary: findMasterPublisher(cfg.projectRoot),
 		feed:         feed,
@@ -684,6 +686,9 @@ func (w *worker) syncOnce() error {
 		if strings.EqualFold(j.EAMode, "CUSTOM") && j.CustomEAPaused {
 			// Paused custom EA: only the report-only terminal keeps running.
 			w.stopMainChild(id, false)
+			if !j.CustomEAInputsKnown {
+				w.startInputDiscovery(j)
+			}
 			w.ensureReporter(j)
 			if w.reporters[id] != nil {
 				_ = w.report(id, "RUNNING", "EA kustom dijeda. Atur parameter lalu jalankan dari portal.")
