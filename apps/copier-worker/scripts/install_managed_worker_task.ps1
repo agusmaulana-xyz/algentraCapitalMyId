@@ -11,6 +11,18 @@ $ErrorActionPreference = 'Stop'
 $resolvedRoot = (Resolve-Path -LiteralPath $ProjectRoot).Path
 $workerBinary = Join-Path $resolvedRoot "algentra-copier-worker.exe"
 if (-not (Test-Path -LiteralPath $workerBinary -PathType Leaf)) { $workerBinary = Join-Path $resolvedRoot "bin\copier-worker.exe" }
+$go = Get-Command go.exe -ErrorAction SilentlyContinue
+if ((Test-Path -LiteralPath (Join-Path $resolvedRoot 'go.mod') -PathType Leaf) -and $go) {
+	# Always build the worker from the checked-out source during installation.
+	# A pre-existing bin\copier-worker.exe may be stale and silently reintroduce
+	# a fixed runtime crash (for example, exhausting Windows callback slots).
+	New-Item -ItemType Directory -Path (Join-Path $resolvedRoot 'bin') -Force | Out-Null
+	$workerBinary = Join-Path $resolvedRoot 'bin\copier-worker.exe'
+	Push-Location $resolvedRoot
+	try { & $go.Source build -ldflags='-s -w' -o $workerBinary ./cmd/copier-worker } finally { Pop-Location }
+	if ($LASTEXITCODE -ne 0) { throw 'Build binary copier-worker dari source terbaru gagal.' }
+	Write-Host "Worker dibangun dari source terbaru: $workerBinary"
+}
 $masterPublisher = Join-Path $resolvedRoot "algentra-copier-master.exe"
 if (-not (Test-Path -LiteralPath $masterPublisher -PathType Leaf)) { $masterPublisher = Join-Path $resolvedRoot "bin\copier-master.exe" }
 $workerPackage = Join-Path $resolvedRoot "apps\copier-worker"
@@ -21,16 +33,7 @@ $workerExamplePath = Join-Path $configDirectory "managed-worker.example.json"
 $masterConfigPath = Join-Path $configDirectory "master.json"
 $masterExamplePath = Join-Path $configDirectory "master.example.json"
 if (-not (Test-Path -LiteralPath $workerBinary -PathType Leaf)) {
-	$go = Get-Command go.exe -ErrorAction SilentlyContinue
-	if ((Test-Path -LiteralPath (Join-Path $resolvedRoot 'go.mod') -PathType Leaf) -and $go) {
-		New-Item -ItemType Directory -Path (Join-Path $resolvedRoot 'bin') -Force | Out-Null
-		$workerBinary = Join-Path $resolvedRoot 'bin\copier-worker.exe'
-		Push-Location $resolvedRoot
-		try { & $go.Source build -ldflags='-s -w' -o $workerBinary ./cmd/copier-worker } finally { Pop-Location }
-		if ($LASTEXITCODE -ne 0) { throw 'Build binary copier-worker gagal.' }
-	} else {
-		throw "Binary managed worker Go tidak ditemukan: $workerBinary. Paket produksi harus menyertakan bin\copier-worker.exe."
-	}
+	throw "Binary managed worker Go tidak ditemukan: $workerBinary. Sediakan Go dan source repo, atau sertakan bin\copier-worker.exe."
 }
 if (-not (Test-Path -LiteralPath $masterPublisher -PathType Leaf)) {
     $go = Get-Command go.exe -ErrorAction SilentlyContinue
