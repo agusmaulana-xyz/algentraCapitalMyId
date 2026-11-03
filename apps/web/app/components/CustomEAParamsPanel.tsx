@@ -72,8 +72,9 @@ export function CustomEAParamsPanel({ accountId }: { accountId: string }) {
   };
 
   return (
+    <main className="page-shell dashboard-page account-page" id="main-content" tabIndex={-1}>
     <section className="panel section ea-params">
-      <header className="ea-params__head">
+      <div className="ea-params__head">
         <span className="eyebrow">EA sendiri</span>
         <h2>Parameter EA</h2>
         {data?.custom_ea_name ? <p className="ea-params__file">{data.custom_ea_name}</p> : null}
@@ -82,7 +83,7 @@ export function CustomEAParamsPanel({ accountId }: { accountId: string }) {
             {data.paused ? "Dijeda" : "Berjalan"}
           </span>
         ) : null}
-      </header>
+      </div>
       <p className="muted ea-params__hint">
         Kosongkan kolom untuk memakai nilai default EA. {data?.paused ? "EA sedang dijeda; simpan parameter lalu tekan Jalankan EA." : "Perubahan akan memulai ulang terminal akun ini."}
       </p>
@@ -117,12 +118,13 @@ export function CustomEAParamsPanel({ accountId }: { accountId: string }) {
           <button type="button" className="secondary ea-params__add" onClick={() => setRows((current) => [...current, { name: "", value: "" }])}>+ Tambah parameter</button>
         </div>
       )}
-      <footer className="ea-params__actions">
+      <div className="ea-params__actions">
         <button type="button" disabled={busy || !data} onClick={() => void save()}>{busy ? "Menyimpan…" : "Simpan parameter"}</button>
         {data ? <button type="button" className="secondary" disabled={busy} onClick={() => void setPaused(!data.paused)}>{data.paused ? "Jalankan EA" : "Pause EA"}</button> : null}
         <a className="ea-params__back" href="/account">← Kembali ke akun</a>
-      </footer>
+      </div>
       {message ? <p className="status" role="status">{message}</p> : null}
     </section>
+    </main>
   );
 }
