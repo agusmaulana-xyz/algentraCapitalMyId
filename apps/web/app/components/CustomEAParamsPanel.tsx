@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { apiRequest } from "../lib/api";
 
 type EAInput = { name: string; type: string; default: string; comment: string };
@@ -36,6 +36,7 @@ export function CustomEAParamsPanel({ accountId }: { accountId: string }) {
   const [rows, setRows] = useState<Row[]>([]);
   const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
+  const paramsEdited = useRef(false);
 
   const load = useCallback(async () => {
     try {
@@ -50,6 +51,30 @@ export function CustomEAParamsPanel({ accountId }: { accountId: string }) {
   }, [accountId]);
 
   useEffect(() => { void load(); }, [load]);
+
+  useEffect(() => {
+    if (!data?.free_form || paramsEdited.current) return;
+    let cancelled = false;
+    let requestBusy = false;
+    const timer = window.setInterval(() => {
+      if (cancelled || document.hidden || requestBusy || paramsEdited.current) return;
+      requestBusy = true;
+      void apiRequest<ParamsResponse>(`mt5/accounts/${encodeURIComponent(accountId)}/custom-ea/params`)
+        .then((response) => {
+          if (cancelled || response.free_form || paramsEdited.current) return;
+          setData(response);
+          setValues(response.params);
+          setRows(Object.entries(response.params).map(([name, value]) => ({ name, value })));
+          setMessage(`${response.inputs.length} parameter EA terdeteksi dan dimuat otomatis.`);
+        })
+        .catch(() => {})
+        .finally(() => { requestBusy = false; });
+    }, 15_000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [accountId, data?.free_form]);
 
   const save = async () => {
     if (!data) return;
@@ -107,6 +132,7 @@ export function CustomEAParamsPanel({ accountId }: { accountId: string }) {
         setMessage("Tidak ada parameter yang terbaca. Simpan file .set dari tab Inputs EA di MT5 lalu coba lagi.");
         return;
       }
+      paramsEdited.current = true;
       setRows(imported);
       setMessage(`${imported.length} parameter berhasil dimuat dari ${file.name}. Tekan Simpan parameter untuk menerapkannya.`);
     } catch {
@@ -150,19 +176,22 @@ export function CustomEAParamsPanel({ accountId }: { accountId: string }) {
       )}
       {data?.free_form && (
         <div className="ea-params__manual">
-          <p className="muted">Daftar input EA belum terdeteksi otomatis. Di MT5, buka properti EA pada chart, pilih tab Inputs, lalu klik Save untuk membuat file .set. Impor file itu di sini agar semua nama dan nilai parameter dimuat sekaligus.</p>
+          <p className="muted">Daftar input EA belum tersedia. Worker akan membacanya otomatis dari terminal, dan halaman ini mengecek hasilnya secara berkala.</p>
+          <details className="ea-params__fallback">
+            <summary>Opsi cadangan: impor file .set dari MT5</summary>
           <label className="secondary ea-params__import">
             Impor parameter dari file .set
             <input type="file" accept=".set,text/plain" onChange={(event) => void importPreset(event)} />
           </label>
+          </details>
           {rows.map((row, index) => (
             <div className="ea-params__row" key={index}>
-              <input aria-label="Nama parameter" placeholder="NamaParameter" maxLength={64} value={row.name} onChange={(event) => { const name = event.currentTarget.value; setRows((current) => current.map((item, i) => (i === index ? { ...item, name } : item))); }} />
-              <input aria-label="Nilai parameter" placeholder="Nilai" maxLength={256} value={row.value} onChange={(event) => { const value = event.currentTarget.value; setRows((current) => current.map((item, i) => (i === index ? { ...item, value } : item))); }} />
-              <button type="button" className="secondary" onClick={() => setRows((current) => current.filter((_, i) => i !== index))}>Hapus</button>
+              <input aria-label="Nama parameter" placeholder="NamaParameter" maxLength={64} value={row.name} onChange={(event) => { paramsEdited.current = true; const name = event.currentTarget.value; setRows((current) => current.map((item, i) => (i === index ? { ...item, name } : item))); }} />
+              <input aria-label="Nilai parameter" placeholder="Nilai" maxLength={256} value={row.value} onChange={(event) => { paramsEdited.current = true; const value = event.currentTarget.value; setRows((current) => current.map((item, i) => (i === index ? { ...item, value } : item))); }} />
+              <button type="button" className="secondary" onClick={() => { paramsEdited.current = true; setRows((current) => current.filter((_, i) => i !== index)); }}>Hapus</button>
             </div>
           ))}
-          <button type="button" className="secondary ea-params__add" onClick={() => setRows((current) => [...current, { name: "", value: "" }])}>+ Tambah parameter</button>
+          <button type="button" className="secondary ea-params__add" onClick={() => { paramsEdited.current = true; setRows((current) => [...current, { name: "", value: "" }]); }}>+ Tambah parameter</button>
         </div>
       )}
       <div className="ea-params__actions">

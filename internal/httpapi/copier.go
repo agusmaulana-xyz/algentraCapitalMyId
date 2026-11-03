@@ -560,7 +560,7 @@ func (api copierAPI) reportStatus(w http.ResponseWriter, r *http.Request) {
 		_, err = api.pool.Exec(ctx, `
 			UPDATE managed_copy_profiles
 			SET status = $2, status_message = $3, login_status = 'VALID',
-			    login_message = 'Login broker berhasil dan terminal siap untuk copy trading.', last_seen_at = $4
+			login_message = 'Login broker tervalidasi dengan MT5 Login Probe. Terminal follower dijalankan oleh worker copier.', last_seen_at = $4
 			WHERE account_id = $1
 		`, accountID, status, statusMessage, time.Now().UTC())
 	} else {

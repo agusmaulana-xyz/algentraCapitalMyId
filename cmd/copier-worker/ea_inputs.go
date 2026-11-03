@@ -13,7 +13,7 @@ import (
 	"time"
 )
 
-const discoverRetryDelay = 10 * time.Minute
+const discoverRetryDelay = 2 * time.Minute
 
 const maxCaptureAttempts = 2
 
@@ -164,11 +164,20 @@ func (w *worker) captureRunningInputs(j job, c *child) bool {
 	clearSavedCharts(accountDir)
 	if !ok {
 		log.Printf("daftar parameter EA akun %d belum terbaca dari terminal yang berjalan (percobaan %d)", j.AccountID, attempts+1)
+		if attempts+1 >= maxCaptureAttempts {
+			// If the customer's running terminal does not persist its chart profile,
+			// retry discovery in a dedicated safe terminal so the client does not
+			// have to pause the EA or refresh the portal manually.
+			w.startInputDiscovery(j)
+		}
 		return true
 	}
 	var ignored any
 	if err := w.request(fmt.Sprintf("/api/mt5/copier/accounts/%d/custom-ea/inputs", j.AccountID), map[string]any{"inputs": inputs}, &ignored); err != nil {
 		log.Printf("daftar parameter EA akun %d gagal dikirim: %v", j.AccountID, err)
+		if attempts+1 >= maxCaptureAttempts {
+			w.startInputDiscovery(j)
+		}
 		return true
 	}
 	log.Printf("daftar parameter EA akun %d terbaca dari terminal yang berjalan: %d input", j.AccountID, len(inputs))

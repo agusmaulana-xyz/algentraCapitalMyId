@@ -276,10 +276,29 @@ Register-ScheduledTask `
     -Description "Menjalankan Algentra managed copier saat Windows startup." `
     -Force | Out-Null
 Start-ScheduledTask -TaskName $taskName
-Start-Sleep -Seconds 3
-$task = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
-if ($task.State -ne "Running") {
+$startDeadline = [DateTime]::UtcNow.AddSeconds(45)
+$task = $null
+$workerProcess = $null
+do {
+    $task = Get-ScheduledTask -TaskName $taskName -ErrorAction Stop
+    $workerProcess = Get-CimInstance Win32_Process -Filter "Name='$workerProcessName'" -ErrorAction SilentlyContinue |
+        Where-Object {
+            $_.ExecutablePath -and
+            [string]::Equals([IO.Path]::GetFullPath($_.ExecutablePath), $workerBinaryFullPath, [StringComparison]::OrdinalIgnoreCase) -and
+            $_.CommandLine -and $_.CommandLine.Contains($workerConfigFullPath)
+        } | Select-Object -First 1
+    if ($workerProcess) { break }
+    if ([DateTime]::UtcNow -ge $startDeadline) { break }
+    Start-Sleep -Seconds 1
+} while ($true)
+
+if (-not $workerProcess) {
     $taskInfo = Get-ScheduledTaskInfo -TaskName $taskName
-    throw "Worker task tidak berjalan (state $($task.State), result $($taskInfo.LastTaskResult)). Periksa konfigurasi dan log Task Scheduler."
+    $recentError = if (Test-Path -LiteralPath $taskErrorLog -PathType Leaf) {
+        (Get-Content -LiteralPath $taskErrorLog -Tail 12 -ErrorAction SilentlyContinue) -join "`n"
+    } else {
+        "(log startup belum dibuat)"
+    }
+    throw "Worker process tidak muncul setelah 45 detik (task state $($task.State), result $($taskInfo.LastTaskResult)). Log startup: $taskErrorLog`n$recentError"
 }
 Write-Output "Scheduled task '$taskName' dibuat dan dimulai untuk $resolvedRoot"
