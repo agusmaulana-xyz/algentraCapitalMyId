@@ -1,18 +1,12 @@
-# API contracts
+# Kontrak API
 
-`openapi.json` is the checked-in contract for the versioned API. The existing
-`/api/...` endpoints remain available for installed clients while consumers move
-to `/v1/...` paths. Dashboard operations are under `/v1/dashboard`; public
-performance endpoints are under `/v1/public`.
+`openapi.json` adalah kontrak API yang dilacak Git. Selaraskan file ini dengan Core API saat menambah atau mengubah endpoint. Tipe TypeScript hasil generate ditulis ke `src/generated.d.ts` dan digunakan oleh aplikasi web.
 
-`openapi.json` is the source of truth for generated client types. Update it when
-the Go API contract changes, then regenerate the TypeScript types:
+Pasang dependensi sesuai lockfile dan generate ulang tipe dari direktori ini:
 
 ```powershell
-Set-Location packages\contracts
-npm install
+npm ci
 npm run generate:types
 ```
 
-Do not place database credentials or Supabase API keys in the web app. The web
-server must call the core API.
+Saat bentuk API berubah, periksa lalu commit kontrak dan tipe hasil generate. Jangan masukkan kredensial database atau secret API ke kode browser; kode server web yang memanggil Core API.

@@ -4,11 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	dbstore "github.com/rnpproject/algentra-backend/internal/database"
 	"io"
 	"net/http"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rnpproject/algentra-backend/internal/auth"
 	"github.com/rnpproject/algentra-backend/internal/database"
 	"github.com/rnpproject/algentra-backend/internal/ea/snapshot"
@@ -16,46 +16,36 @@ import (
 )
 
 type ServerConfig struct {
-	Environment             string
-	ProjectRef              string
-	BFFSecret               string
-	ServiceName             string
-	CookieSecure            bool
-	WebSocketOrigins        []string
-	TelegramManager         *telegramclient.Manager
-	AppSecretKey            string
-	WorkerAPIKey            string
-	EAAPIKey                string
-	Contact                 ContactConfig
-	Pricing                 ServicePricing
-	PublicMusicURL          string
-	GeminiAPIKey            string
-	GeminiModel             string
-	GeminiTimeoutSeconds    float64
-	GeminiRetryAttempts     int
-	EnableRegexFallback     bool
-	GeminiCSAPIKey          string
-	GeminiCSModel           string
-	GeminiCSTimeoutSeconds  int
-	ProjectRoot             string
-	PaymentBankName         string
-	PaymentNumber           string
-	PaymentName             string
-	MidtransConfigured      bool
-	MidtransServerKey       string
-	MidtransMerchantID      string
-	MidtransProduction      bool
-	MidtransNotificationURL string
-	TelegramBotToken        string
-	TelegramAdminChatID     string
-	BotContext              context.Context
-	EmailConfigured         bool
-	EmailSMTPHost           string
-	EmailSMTPPort           int
-	EmailSMTPUsername       string
-	EmailSMTPPassword       string
-	EmailFrom               string
-	EmailSMTPStartTLS       bool
+	Environment           string
+	MT5BrokerDirectoryURL string
+	ServiceName           string
+	CookieSecure          bool
+	WebSocketOrigins      []string
+	TelegramManager       *telegramclient.Manager
+	AppSecretKey          string
+	WorkerAPIKey          string
+	EAAPIKey              string
+	Contact               ContactConfig
+	Pricing               ServicePricing
+	GeminiAPIKey          string
+	GeminiModel           string
+	ProjectRoot           string
+	PaymentBankName       string
+	PaymentNumber         string
+	PaymentName           string
+	AirPayConfigured      bool
+	AirPayAPIKey          string
+	AirPayMerchantUID     string
+	TelegramBotToken      string
+	TelegramAdminChatID   string
+	BotContext            context.Context
+	EmailConfigured       bool
+	EmailSMTPHost         string
+	EmailSMTPPort         int
+	EmailSMTPUsername     string
+	EmailSMTPPassword     string
+	EmailFrom             string
+	EmailSMTPStartTLS     bool
 }
 
 type ContactConfig struct {
@@ -87,7 +77,7 @@ type ServicePricing struct {
 	VPSOptions       []VPSPlan
 }
 
-func NewHandler(pool *pgxpool.Pool, cfg ServerConfig) http.Handler {
+func NewHandler(pool *dbstore.Pool, cfg ServerConfig) http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/health", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet && r.Method != http.MethodHead {
@@ -103,7 +93,7 @@ func NewHandler(pool *pgxpool.Pool, cfg ServerConfig) http.Handler {
 		}
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
-		if err := database.CheckReady(ctx, pool, cfg.Environment, cfg.ProjectRef); err != nil {
+		if err := database.CheckReady(ctx, pool, "", ""); err != nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
 				"status": "not_ready", "checks": map[string]string{"database": "unavailable"},
 			})
@@ -121,15 +111,16 @@ func NewHandler(pool *pgxpool.Pool, cfg ServerConfig) http.Handler {
 	eaSnapshot := eaSnapshotAPI{pool: pool, key: cfg.EAAPIKey, state: &snapshot.Store{}}
 	mt5Updates := newMT5UpdateHub()
 	eaSnapshot.register(mux)
-	registerPublicRoutes(mux, pool, cfg.Contact, cfg.PublicMusicURL, eaSnapshot.state, cfg.WebSocketOrigins)
+	registerPublicRoutes(mux, pool, cfg.Contact, eaSnapshot.state, cfg.WebSocketOrigins)
 	registerDownloads(mux, cfg.ProjectRoot)
+	mux.HandleFunc("GET /api/mt5/servers", mt5ServerDirectory(cfg.MT5BrokerDirectoryURL))
 	(clientMT5API{pool: pool, state: eaSnapshot.state, pricing: cfg.Pricing, workerConfigured: cfg.WorkerAPIKey != "", copierAPIKey: cfg.WorkerAPIKey, appSecret: cfg.AppSecretKey, updates: mt5Updates}).register(mux)
 	adminAccounts := mt5AccountDetailsAPI{pool: pool}
 	for _, prefix := range []string{"/api/admin", "/v1/admin"} {
 		mux.HandleFunc("GET "+prefix+"/copy-accounts", adminAccounts.list)
 		mux.HandleFunc("GET "+prefix+"/copy-accounts/{account_id}/details", adminAccounts.details)
 	}
-	payments := paymentAPI{pool: pool, pricing: cfg.Pricing, workerConfigured: cfg.WorkerAPIKey != "", bankName: cfg.PaymentBankName, paymentNumber: cfg.PaymentNumber, paymentName: cfg.PaymentName, qrisAvailable: cfg.MidtransConfigured, projectRoot: cfg.ProjectRoot, midtransServerKey: cfg.MidtransServerKey, midtransMerchantID: cfg.MidtransMerchantID, midtransProduction: cfg.MidtransProduction, midtransNotificationURL: cfg.MidtransNotificationURL}
+	payments := paymentAPI{pool: pool, pricing: cfg.Pricing, workerConfigured: cfg.WorkerAPIKey != "", bankName: cfg.PaymentBankName, paymentNumber: cfg.PaymentNumber, paymentName: cfg.PaymentName, qrisAvailable: cfg.AirPayConfigured, projectRoot: cfg.ProjectRoot, airPayAPIKey: cfg.AirPayAPIKey, airPayMerchantUID: cfg.AirPayMerchantUID}
 	if cfg.TelegramBotToken != "" && cfg.TelegramAdminChatID != "" {
 		payments.bot = &telegramPaymentBot{pool: pool, token: cfg.TelegramBotToken, chatID: cfg.TelegramAdminChatID, pricing: cfg.Pricing, projectRoot: cfg.ProjectRoot}
 		botCtx := cfg.BotContext
@@ -139,12 +130,12 @@ func NewHandler(pool *pgxpool.Pool, cfg ServerConfig) http.Handler {
 		go payments.bot.run(botCtx)
 	}
 	payments.register(mux)
-	settingsAPI{pool: pool, appEnv: cfg.Environment, geminiAPIKey: cfg.GeminiAPIKey, geminiModel: cfg.GeminiModel}.register(mux)
+	settingsAPI{pool: pool, appEnv: cfg.Environment, eaAPIKey: cfg.EAAPIKey, geminiAPIKey: cfg.GeminiAPIKey, geminiModel: cfg.GeminiModel}.register(mux)
 	dashboardAPI{pool: pool, state: eaSnapshot.state, telegram: cfg.TelegramManager, geminiKey: cfg.GeminiAPIKey, geminiModel: cfg.GeminiModel, websocketOrigin: cfg.WebSocketOrigins}.register(mux)
-	parser := parserAPI{pool: pool, key: cfg.GeminiAPIKey, model: cfg.GeminiModel, timeout: time.Duration(cfg.GeminiTimeoutSeconds * float64(time.Second)), retries: cfg.GeminiRetryAttempts, regexFallback: cfg.EnableRegexFallback}
+	parser := parserAPI{pool: pool, key: cfg.GeminiAPIKey, model: cfg.GeminiModel, timeout: 25 * time.Second, retries: 3}
 	telegramAPI{pool: pool, manager: cfg.TelegramManager, parser: parser}.register(mux)
 	parser.register(mux)
-	customerServiceAPI{pool: pool, ctx: cfg.BotContext, secret: cfg.AppSecretKey, cookieSecure: cfg.CookieSecure, key: cfg.GeminiCSAPIKey, model: cfg.GeminiCSModel, timeout: time.Duration(cfg.GeminiCSTimeoutSeconds) * time.Second}.register(mux)
+	customerServiceAPI{pool: pool, ctx: cfg.BotContext, secret: cfg.AppSecretKey, cookieSecure: cfg.CookieSecure, key: cfg.GeminiAPIKey, model: cfg.GeminiModel, timeout: 60 * time.Second}.register(mux)
 	copierRoutes := copierAPI{pool: pool, apiKey: cfg.WorkerAPIKey, secret: cfg.AppSecretKey, master: eaSnapshot.state, updates: mt5Updates}
 	copierRoutes.register(mux, "/api/mt5")
 	copierRoutes.register(mux, "/v1/mt5")
@@ -152,12 +143,12 @@ func NewHandler(pool *pgxpool.Pool, cfg ServerConfig) http.Handler {
 		writeJSON(w, http.StatusNotFound, map[string]string{"detail": "Not Found"})
 	})
 	handler := SessionMiddleware(pool, cfg.AppSecretKey, cfg.CookieSecure, mux)
-	handler = BFFSignature(cfg.BFFSecret, handler)
+	handler = OriginProtection(handler)
 	handler = RateLimit(handler)
 	return SecurityHeaders(handler, cfg.CookieSecure)
 }
 
-func clientLogin(pool *pgxpool.Pool) http.HandlerFunc {
+func clientLogin(pool *dbstore.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeMethodNotAllowed(w, http.MethodPost)
@@ -222,7 +213,7 @@ func writeMethodNotAllowed(w http.ResponseWriter, allowed string) {
 	writeJSON(w, http.StatusMethodNotAllowed, map[string]string{"detail": "Method Not Allowed"})
 }
 
-func adminLogin(pool *pgxpool.Pool) http.HandlerFunc {
+func adminLogin(pool *dbstore.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
 			writeMethodNotAllowed(w, http.MethodPost)
@@ -325,4 +316,10 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+func writeError(w http.ResponseWriter, status int, detail string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]string{"detail": detail})
 }

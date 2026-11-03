@@ -4,18 +4,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	dbstore "github.com/rnpproject/algentra-backend/internal/database"
 	"net/http"
 	"strings"
 	"time"
 
 	gotdAuth "github.com/gotd/td/telegram/auth"
 	"github.com/gotd/td/tgerr"
-	"github.com/jackc/pgx/v5/pgxpool"
 	telegramclient "github.com/rnpproject/algentra-backend/internal/telegram"
 )
 
 type telegramAPI struct {
-	pool    *pgxpool.Pool
+	pool    *dbstore.Pool
 	manager *telegramclient.Manager
 	parser  parserAPI
 }

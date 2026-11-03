@@ -5,10 +5,11 @@ import { apiRequest } from "../lib/api";
 import { formatInteger, formatLots, formatMoney, formatPrice, numberTone, toneClass } from "../lib/format";
 
 type Daily = { date: string; profit: number; currency?: string | null; timezone: string };
-type Deal = { ticket: string; time: string; symbol: string; action: string; entry: string; volume: number; price: number; net_profit: number; currency?: string | null };
+type Deal = { ticket: string; symbol: string; action: string; volume: number; open_time?: string | null; close_time?: string | null; open_price?: number | null; close_price?: number | null; status: string; net_profit: number; currency?: string | null };
 type Details = { balance?: number | null; equity?: number | null; floating_profit?: number | null; margin?: number | null; free_margin?: number | null; currency?: string | null; open_positions?: number; state_updated_at?: string | null; daily_profit: Daily[]; history: Deal[]; history_page: number; history_pages: number; history_total: number };
 
 const WIB = "Asia/Jakarta";
+const EMPTY = "—";
 const wibDate = (date: string) => new Date(`${date}T00:00:00+07:00`).toLocaleDateString("id-ID", { timeZone: WIB, weekday: "short", day: "2-digit", month: "short" });
 const wibStamp = (date: string) => new Date(date).toLocaleString("id-ID", { timeZone: WIB, day: "2-digit", month: "short", hour: "2-digit", minute: "2-digit" });
 const wibFull = (date: string) => new Date(date).toLocaleString("id-ID", { timeZone: WIB });
@@ -89,7 +90,7 @@ export function AccountPerformanceDetails({ accountId, admin = false, compact = 
       {error && <p className="status tone-neg" role="alert">{error}</p>}
       {details && <>
         <p className="account-detail__meta muted">
-          {details.state_updated_at ? `Data terakhir: ${wibFull(details.state_updated_at)} WIB` : "Belum ada laporan dari terminal."}
+          {details.state_updated_at ? `Data terakhir: ${wibFull(details.state_updated_at)} WIB` : "Belum ada data dari terminal."}
         </p>
         <dl className="account-stats">
           {stats.map(item => <div key={item.label}><dt>{item.label}</dt><dd className={item.tone}>{item.value}</dd></div>)}
@@ -106,18 +107,20 @@ export function AccountPerformanceDetails({ accountId, admin = false, compact = 
         <div>
           <div className="account-detail__heading">
             <h3>Riwayat transaksi MT5</h3>
-            <span className="muted">{formatInteger(details.history_total)} transaksi</span>
+            <span className="muted">{formatInteger(details.history_total)} posisi</span>
           </div>
-          {details.history.length === 0 ? <p className="muted">Belum ada transaksi yang dilaporkan.</p> : <>
+          {details.history.length === 0 ? <p className="muted">Belum ada transaksi.</p> : <>
             <div className="table-wrap account-history">
               <table>
-                <thead><tr><th>Waktu (WIB)</th><th>Simbol</th><th>Arah</th><th className="num">Volume</th><th className="num">Harga</th><th className="num">Profit bersih</th></tr></thead>
+                <thead><tr><th>Dibuka (WIB)</th><th>Ditutup (WIB)</th><th>Simbol</th><th>Arah</th><th className="num">Volume</th><th className="num">Harga buka</th><th className="num">Harga tutup</th><th className="num">Profit bersih</th></tr></thead>
                 <tbody>{details.history.map((deal, index) => <tr key={`${deal.ticket}-${index}`}>
-                  <td>{wibStamp(deal.time)}</td>
+                  <td>{deal.open_time ? wibStamp(deal.open_time) : EMPTY}</td>
+                  <td>{deal.close_time ? wibStamp(deal.close_time) : <span className={`pill ${toneClass("warn")}`}>Terbuka</span>}</td>
                   <td>{deal.symbol}</td>
-                  <td><span className={`pill ${toneClass(sideTone(deal.action))}`}>{deal.action}</span> <span className="muted">{deal.entry}</span></td>
+                  <td><span className={`pill ${toneClass(sideTone(deal.action))}`}>{deal.action}</span></td>
                   <td className="num">{formatLots(deal.volume)}</td>
-                  <td className="num">{formatPrice(deal.price)}</td>
+                  <td className="num">{deal.open_price == null ? EMPTY : formatPrice(deal.open_price)}</td>
+                  <td className="num">{deal.close_price == null ? EMPTY : formatPrice(deal.close_price)}</td>
                   <td className={`num ${toneClass(numberTone(deal.net_profit))}`}>{formatMoney(deal.net_profit, deal.currency ?? currency)}</td>
                 </tr>)}</tbody>
               </table>

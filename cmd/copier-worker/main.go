@@ -41,6 +41,7 @@ type config struct {
 	FeedAddress            string `json:"feed_address"`
 	PollSeconds            int    `json:"poll_seconds"`
 	HeartbeatTimeoutSecond int    `json:"heartbeat_timeout_seconds"`
+	ProjectRoot            string `json:"project_root"`
 
 	configDir, apiBase, masterConfig, masterTerminalPath, templateDir, runtimeDir string
 	projectRoot, apiKey, masterToken                                              string
@@ -50,18 +51,21 @@ type config struct {
 }
 
 type job struct {
-	AccountID        int64   `json:"account_id"`
-	Label            string  `json:"label"`
-	Login            string  `json:"login"`
-	Server           string  `json:"server"`
-	BrokerPassword   string  `json:"broker_password"`
-	FollowerSymbol   string  `json:"follower_symbol"`
-	ModeLot          string  `json:"mode_lot"`
-	RatioLot         float64 `json:"ratio_lot"`
-	FixedLot         float64 `json:"lot_tetap"`
-	MaxLotPerOrder   float64 `json:"max_lot_per_order"`
-	MaxLotTotal      float64 `json:"max_lot_total"`
-	MaxOpenPositions int     `json:"max_open_positions"`
+	AccountID         int64   `json:"account_id"`
+	Label             string  `json:"label"`
+	Login             string  `json:"login"`
+	Server            string  `json:"server"`
+	BrokerPassword    string  `json:"broker_password"`
+	FollowerSymbol    string  `json:"follower_symbol"`
+	ModeLot           string  `json:"mode_lot"`
+	RatioLot          float64 `json:"ratio_lot"`
+	FixedLot          float64 `json:"lot_tetap"`
+	MaxLotPerOrder    float64 `json:"max_lot_per_order"`
+	MaxLotTotal       float64 `json:"max_lot_total"`
+	MaxOpenPositions  int     `json:"max_open_positions"`
+	EAMode            string  `json:"ea_mode"`
+	CustomEAName      string  `json:"custom_ea_name"`
+	CustomEAUpdatedAt string  `json:"custom_ea_updated_at"`
 }
 
 type loginCheck struct {
@@ -180,6 +184,9 @@ func loadConfig(path string) (config, error) {
 	cfg.PollSeconds = clamp(cfg.PollSeconds, 1, 60, 5)
 	cfg.HeartbeatTimeoutSecond = clamp(cfg.HeartbeatTimeoutSecond, 15, 180, 45)
 	cfg.projectRoot = findProjectRoot(absolute)
+	if strings.TrimSpace(cfg.ProjectRoot) != "" {
+		cfg.projectRoot = resolve(cfg.configDir, cfg.ProjectRoot)
+	}
 	cfg.apiKey = strings.TrimSpace(os.Getenv(cfg.WorkerAPIKeyEnv))
 	cfg.masterToken = os.Getenv("MASTER_PUBLISHER_TOKEN")
 	if len(cfg.apiKey) < 32 {
@@ -254,7 +261,7 @@ func newWorker(cfg config) (*worker, error) {
 	return &worker{
 		cfg: cfg, client: &http.Client{Timeout: 20 * time.Second, Transport: transport}, children: map[int64]*child{},
 		retryAt: map[int64]time.Time{}, failures: map[int64]int{}, stop: make(chan struct{}), checking: map[int64]bool{},
-		masterBinary: filepath.Join(cfg.projectRoot, "algentra-copier-master.exe"),
+		masterBinary: findMasterPublisher(cfg.projectRoot),
 		feed:         feed,
 	}, nil
 }
@@ -428,16 +435,23 @@ func (w *worker) startJob(j job, now time.Time) error {
 		w.feed.Unregister(j.AccountID)
 		return err
 	}
-	c := &child{accountID: j.AccountID, fingerprint: fingerprint(j), cmd: cmd, done: make(chan error, 1), stopped: make(chan struct{}), log: logFile, heartbeat: heartbeat, startedAt: now, executor: "mt5_ea", feedToken: token, startupINI: configPath}
+	executor := "mt5_ea"
+	if strings.EqualFold(j.EAMode, "CUSTOM") {
+		executor = "custom_ea"
+	}
+	c := &child{accountID: j.AccountID, fingerprint: fingerprint(j), cmd: cmd, done: make(chan error, 1), stopped: make(chan struct{}), log: logFile, heartbeat: heartbeat, startedAt: now, executor: executor, feedToken: token, startupINI: configPath}
 	w.children[j.AccountID] = c
 	go func() {
 		c.done <- cmd.Wait()
 		close(c.stopped)
 	}()
-	go w.serveManagedFileBridge(c)
-	go w.watchReport(c)
+	go manageMT5Charts(uint32(cmd.Process.Pid), c.stopped, true)
+	if c.executor == "mt5_ea" {
+		go w.serveManagedFileBridge(c)
+		go w.watchReport(c)
+	}
 	_ = w.report(j.AccountID, "STARTING", "")
-	log.Printf("follower managed akun %d (mt5_ea) dimulai pid=%d", j.AccountID, cmd.Process.Pid)
+	log.Printf("follower managed akun %d (%s) dimulai pid=%d", j.AccountID, executor, cmd.Process.Pid)
 	go w.removeStartupConfigAfterLaunch(c)
 	return nil
 }
@@ -446,9 +460,14 @@ func (w *worker) makeJobConfig(j job) (string, string, string, error) {
 	if j.AccountID <= 0 || j.BrokerPassword == "" || j.Login == "" || j.Server == "" {
 		return "", "", "", errors.New("data akun follower tidak lengkap")
 	}
-	token, err := newFeedToken()
-	if err != nil {
-		return "", "", "", err
+	var token string
+	var err error
+	customEA := strings.EqualFold(j.EAMode, "CUSTOM")
+	if !customEA {
+		token, err = newFeedToken()
+		if err != nil {
+			return "", "", "", err
+		}
 	}
 	name := fmt.Sprintf("managed_%d", j.AccountID)
 	accountDir := filepath.Join(w.cfg.runtimeDir, "terminals", fmt.Sprint(j.AccountID))
@@ -464,28 +483,77 @@ func (w *worker) makeJobConfig(j job) (string, string, string, error) {
 		w.feed.Unregister(j.AccountID)
 		return "", "", "", errors.New("salinan terminal follower tidak lengkap")
 	}
+	clearSavedCharts(accountDir)
 	if err := enableAutoTrading(accountDir); err != nil {
 		w.feed.Unregister(j.AccountID)
 		return "", "", "", fmt.Errorf("auto trading terminal gagal disiapkan: %w", err)
 	}
-	startupServer, lookupErr := findBrokerAccessPoint(j.Server)
-	if lookupErr != nil {
-		if err := seedBrokerServers(accountDir, w.cfg.templateDir, w.cfg.masterTerminalPath); err != nil {
-			w.feed.Unregister(j.AccountID)
-			return "", "", "", errors.New("server broker MT5 tidak ditemukan dan direktori server lokal tidak tersedia")
-		}
-		startupServer = j.Server
+	if err := ensureNativeBrokerServers(accountDir, w.cfg.templateDir, w.cfg.masterTerminalPath, j.Server); err != nil {
+		w.feed.Unregister(j.AccountID)
+		return "", "", "", errors.New("daftar server broker MT5 tidak tersedia pada terminal")
 	}
-	if err := w.prepareManagedEA(j, token, accountDir, name); err != nil {
+	startupServer := w.loginServerFor(accountDir, j.Server)
+	expertName, presetName := "MT5FollowerCopyEA", name+".set"
+	if customEA {
+		customData, err := w.download(fmt.Sprintf("/api/mt5/copier/accounts/%d/custom-ea", j.AccountID))
+		if err != nil {
+			return "", "", "", fmt.Errorf("EA custom akun %d tidak dapat diunduh: %w", j.AccountID, err)
+		}
+		if len(customData) == 0 || len(customData) > 10<<20 {
+			return "", "", "", errors.New("ukuran file EA custom tidak valid")
+		}
+		expertsDir := filepath.Join(accountDir, "MQL5", "Experts", "AlgentraCustom")
+		if err := os.MkdirAll(expertsDir, 0o700); err != nil {
+			return "", "", "", err
+		}
+		switch strings.ToLower(filepath.Ext(j.CustomEAName)) {
+		case ".mq5":
+			sourcePath := filepath.Join(expertsDir, "CustomEA.mq5")
+			if err := writeAtomic(sourcePath, customData); err != nil {
+				return "", "", "", fmt.Errorf("source EA custom akun %d tidak dapat dipasang: %w", j.AccountID, err)
+			}
+			if err := compileCustomEA(accountDir, sourcePath); err != nil {
+				return "", "", "", fmt.Errorf("EA custom akun %d gagal dikompilasi: %w", j.AccountID, err)
+			}
+		case ".ex5":
+			if err := writeAtomic(filepath.Join(expertsDir, "CustomEA.ex5"), customData); err != nil {
+				return "", "", "", fmt.Errorf("EA custom akun %d tidak dapat dipasang: %w", j.AccountID, err)
+			}
+		default:
+			return "", "", "", errors.New("format EA custom harus .mq5 atau .ex5")
+		}
+		expertName, presetName = "AlgentraCustom\\CustomEA", ""
+	} else if err := w.prepareManagedEA(j, token, accountDir, name); err != nil {
 		w.feed.Unregister(j.AccountID)
 		return "", "", "", err
 	}
 	startupConfig := filepath.Join(accountDir, "managed-startup.ini")
-	if err := writeManagedStartup(startupConfig, j, name, startupServer); err != nil {
+	startupSymbol := w.knownAccountSymbol(j.AccountID, mustInt(j.Login), accountDir)
+	if startupSymbol == "" {
+		startupSymbol = "EURUSD"
+	}
+	if err := writeManagedStartup(startupConfig, j, expertName, presetName, startupServer, startupSymbol); err != nil {
 		w.feed.Unregister(j.AccountID)
 		return "", "", "", err
 	}
 	return startupConfig, filepath.Join(w.cfg.runtimeDir, "heartbeats", "heartbeat_"+name+".txt"), token, nil
+}
+
+func (w *worker) download(endpoint string) ([]byte, error) {
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, w.cfg.apiBase+endpoint, nil)
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("X-Copier-Worker-Key", w.cfg.apiKey)
+	resp, err := w.client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("worker API HTTP %d", resp.StatusCode)
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, (10<<20)+1))
 }
 
 const terminalInUseMessage = "File terminal MT5 sedang dipakai proses lain. Tutup terminal MT5 untuk akun ini lalu coba simpan kredensial lagi."
@@ -597,6 +665,15 @@ func (w *worker) syncOnce() error {
 			continue
 		default:
 		}
+		if current.executor == "custom_ea" {
+			if err := os.WriteFile(current.heartbeat, []byte(time.Now().UTC().Format(time.RFC3339Nano)), 0o600); err != nil {
+				_ = w.report(id, "ERROR", "Worker tidak dapat memperbarui status EA kustom.")
+				continue
+			}
+			w.failures[id] = 0
+			_ = w.report(id, "RUNNING", "EA kustom berjalan pada terminal sewa.")
+			continue
+		}
 		info, err := os.Stat(current.heartbeat)
 		heartbeatAge := time.Duration(1<<63 - 1)
 		if err == nil {
@@ -666,6 +743,8 @@ func (w *worker) watchReport(c *child) {
 	reportPath := filepath.Join(w.cfg.runtimeDir, "reports", fmt.Sprintf("%d.json", c.accountID))
 	lastUploaded := ""
 	retryAt := time.Time{}
+	// Reports change on every signal/tick; cap uploads so the API is not flooded.
+	const minUploadGap = 2 * time.Second
 	for {
 		select {
 		case <-c.stopped:
@@ -681,9 +760,9 @@ func (w *worker) watchReport(c *child) {
 			}
 			if w.syncReport(c.accountID) {
 				lastUploaded = version
-				retryAt = time.Time{}
+				retryAt = time.Now().Add(minUploadGap)
 			} else {
-				retryAt = time.Now().Add(time.Second)
+				retryAt = time.Now().Add(5 * time.Second)
 			}
 		}
 	}
@@ -832,6 +911,19 @@ func findProjectRoot(path string) string {
 		}
 		dir = parent
 	}
+}
+
+func findMasterPublisher(root string) string {
+	for _, candidate := range []string{
+		filepath.Join(root, "algentra-copier-master.exe"),
+		filepath.Join(root, "copier-master.exe"),
+		filepath.Join(root, "bin", "copier-master.exe"),
+	} {
+		if info, err := os.Stat(candidate); err == nil && !info.IsDir() {
+			return candidate
+		}
+	}
+	return filepath.Join(root, "algentra-copier-master.exe")
 }
 func parsePositive(value string) (int64, error) {
 	var id int64

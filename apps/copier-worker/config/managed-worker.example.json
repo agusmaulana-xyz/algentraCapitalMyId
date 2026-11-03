@@ -1,6 +1,7 @@
 {
   "api_base_url": "http://127.0.0.1:8000",
   "worker_api_key_env": "COPIER_WORKER_API_KEY",
+  "project_root": ".",
   "master_config": "master.json",
   "master_source": "telegram_signal",
   "terminal_template_dir": "C:/Path/To/Clean/MT5FollowerTemplate",

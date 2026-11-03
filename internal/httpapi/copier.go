@@ -3,9 +3,11 @@ package httpapi
 import (
 	"context"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	dbstore "github.com/rnpproject/algentra-backend/internal/database"
 	"math"
 	"math/big"
 	"net/http"
@@ -15,14 +17,12 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rnpproject/algentra-backend/internal/ea/snapshot"
 	"github.com/rnpproject/algentra-backend/internal/security"
 )
 
 type copierAPI struct {
-	pool    *pgxpool.Pool
+	pool    *dbstore.Pool
 	apiKey  string
 	secret  string
 	master  *snapshot.Store
@@ -30,18 +30,21 @@ type copierAPI struct {
 }
 
 type copierJob struct {
-	AccountID        int64   `json:"account_id"`
-	Label            string  `json:"label"`
-	Login            string  `json:"login"`
-	Server           string  `json:"server"`
-	BrokerPassword   string  `json:"broker_password"`
-	FollowerSymbol   string  `json:"follower_symbol"`
-	ModeLot          string  `json:"mode_lot"`
-	RatioLot         float64 `json:"ratio_lot"`
-	FixedLot         float64 `json:"lot_tetap"`
-	MaxLotPerOrder   float64 `json:"max_lot_per_order"`
-	MaxLotTotal      float64 `json:"max_lot_total"`
-	MaxOpenPositions int     `json:"max_open_positions"`
+	AccountID         int64   `json:"account_id"`
+	Label             string  `json:"label"`
+	Login             string  `json:"login"`
+	Server            string  `json:"server"`
+	BrokerPassword    string  `json:"broker_password"`
+	FollowerSymbol    string  `json:"follower_symbol"`
+	ModeLot           string  `json:"mode_lot"`
+	RatioLot          float64 `json:"ratio_lot"`
+	FixedLot          float64 `json:"lot_tetap"`
+	MaxLotPerOrder    float64 `json:"max_lot_per_order"`
+	MaxLotTotal       float64 `json:"max_lot_total"`
+	MaxOpenPositions  int     `json:"max_open_positions"`
+	EAMode            string  `json:"ea_mode"`
+	CustomEAName      string  `json:"custom_ea_name"`
+	CustomEAUpdatedAt string  `json:"custom_ea_updated_at"`
 }
 
 type loginCheckJob struct {
@@ -134,6 +137,36 @@ func (api copierAPI) register(mux *http.ServeMux, prefix string) {
 	mux.HandleFunc("POST "+prefix+"/copier/jobs/{account_id}/login-check", api.reportLoginCheck)
 	mux.HandleFunc("POST "+prefix+"/copier/jobs/{account_id}/status", api.reportStatus)
 	mux.HandleFunc("POST "+prefix+"/copier/jobs/{account_id}/report", api.reportAccount)
+	mux.HandleFunc("GET "+prefix+"/copier/accounts/{account_id}/custom-ea", api.customEA)
+}
+
+func (api copierAPI) customEA(w http.ResponseWriter, r *http.Request) {
+	if !api.requireWorker(w, r) {
+		return
+	}
+	noStore(w)
+	accountID, ok := pathAccountID(r)
+	if !ok {
+		writeError(w, http.StatusNotFound, "EA akun tidak ditemukan")
+		return
+	}
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	var name string
+	var data []byte
+	err := api.pool.QueryRow(ctx, `SELECT custom_ea_name,custom_ea_data FROM mt5_accounts WHERE id=$1 AND ea_mode='CUSTOM'`, accountID).Scan(&name, &data)
+	if errors.Is(err, sql.ErrNoRows) {
+		writeError(w, http.StatusNotFound, "EA kustom tidak ditemukan")
+		return
+	}
+	if err != nil || len(data) == 0 {
+		writeError(w, http.StatusServiceUnavailable, "EA kustom tidak dapat dibaca")
+		return
+	}
+	w.Header().Set("Content-Type", "application/octet-stream")
+	w.Header().Set("Content-Disposition", `attachment; filename="CustomEA.ex5"`)
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write(data)
 }
 
 // masterSnapshot bridges the TelegramSignalEA snapshot to the local Go
@@ -202,7 +235,7 @@ func (api copierAPI) serviceStatus(w http.ResponseWriter, r *http.Request) {
 			lastSeen = parsed.In(time.FixedZone("WIB", 7*60*60)).Format(time.RFC3339Nano)
 			available = api.apiKey != "" && time.Since(parsed) <= 30*time.Second
 		}
-	} else if !errors.Is(err, pgx.ErrNoRows) {
+	} else if !errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusServiceUnavailable, "Status copier tidak tersedia")
 		return
 	}
@@ -258,15 +291,19 @@ func (api copierAPI) jobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	jobs := make([]copierJob, 0)
+	now := time.Now().UTC().Format(time.RFC3339Nano)
 	rows, err := api.pool.Query(ctx, `
 		SELECT a.id, a.label, a.login, a.server, p.password_ciphertext, p.follower_symbol,
 		       p.mode_lot, p.ratio_lot, p.lot_tetap, p.max_lot_per_order, p.max_lot_total,
-		       p.max_open_positions
+	       p.max_open_positions, COALESCE(a.ea_mode, 'SERVER'), COALESCE(a.custom_ea_name, ''),
+	       COALESCE(a.custom_ea_updated_at, '')
 		FROM managed_copy_profiles AS p
 		JOIN mt5_accounts AS a ON a.id = p.account_id
-		WHERE p.active = TRUE AND a.execution_mode = 'MANAGED'
+		WHERE (p.active = TRUE OR (a.ea_mode = 'CUSTOM' AND p.login_status = 'VALID'))
+		  AND a.execution_mode = 'MANAGED'
+		  AND (a.rental_expires_at IS NULL OR a.rental_expires_at > $1)
 		ORDER BY a.id ASC
-	`)
+	`, now)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "Worker gagal mengambil job")
 		return
@@ -276,7 +313,7 @@ func (api copierAPI) jobs(w http.ResponseWriter, r *http.Request) {
 		var ciphertext string
 		if err := rows.Scan(&job.AccountID, &job.Label, &job.Login, &job.Server, &ciphertext,
 			&job.FollowerSymbol, &job.ModeLot, &job.RatioLot, &job.FixedLot, &job.MaxLotPerOrder,
-			&job.MaxLotTotal, &job.MaxOpenPositions); err != nil {
+			&job.MaxLotTotal, &job.MaxOpenPositions, &job.EAMode, &job.CustomEAName, &job.CustomEAUpdatedAt); err != nil {
 			rows.Close()
 			writeError(w, http.StatusServiceUnavailable, "Worker gagal membaca job")
 			return
@@ -340,7 +377,7 @@ func (api copierAPI) jobs(w http.ResponseWriter, r *http.Request) {
 	checkRows.Close()
 
 	managedIDs := make([]int64, 0)
-	idRows, err := api.pool.Query(ctx, `SELECT id FROM mt5_accounts WHERE execution_mode = 'MANAGED' ORDER BY id ASC`)
+	idRows, err := api.pool.Query(ctx, `SELECT id FROM mt5_accounts WHERE execution_mode = 'MANAGED' AND (rental_expires_at IS NULL OR rental_expires_at > $1) ORDER BY id ASC`, now)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "Worker gagal mengambil daftar akun")
 		return
@@ -392,7 +429,7 @@ func (api copierAPI) reportLoginCheck(w http.ResponseWriter, r *http.Request) {
 	var status string
 	var ownerID int64
 	err := api.pool.QueryRow(ctx, `SELECT p.login_status,a.owner_id FROM managed_copy_profiles p JOIN mt5_accounts a ON a.id=p.account_id WHERE p.account_id = $1`, accountID).Scan(&status, &ownerID)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "Profil managed copy tidak ditemukan")
 		return
 	}
@@ -448,7 +485,7 @@ func (api copierAPI) reportStatus(w http.ResponseWriter, r *http.Request) {
 	var active bool
 	var ownerID int64
 	err := api.pool.QueryRow(ctx, `SELECT p.active,a.owner_id FROM managed_copy_profiles p JOIN mt5_accounts a ON a.id=p.account_id WHERE p.account_id = $1`, accountID).Scan(&active, &ownerID)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "Job copy tidak ditemukan")
 		return
 	}
@@ -519,7 +556,7 @@ func (api copierAPI) reportAccount(w http.ResponseWriter, r *http.Request) {
 		WHERE p.account_id = $1
 		FOR UPDATE OF p
 	`, accountID).Scan(&active, &executionMode, &ownerID)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "Akun managed copy tidak ditemukan")
 		return
 	}
@@ -540,7 +577,7 @@ func (api copierAPI) reportAccount(w http.ResponseWriter, r *http.Request) {
 	cursor, cursorMSC := "0", int64(0)
 	if err := tx.QueryRow(ctx, `
 		SELECT history_cursor, history_cursor_msc FROM mt5_account_state WHERE account_id = $1
-	`, accountID).Scan(&cursor, &cursorMSC); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+	`, accountID).Scan(&cursor, &cursorMSC); err != nil && !errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusServiceUnavailable, "Laporan akun MT5 tidak dapat disimpan")
 		return
 	}

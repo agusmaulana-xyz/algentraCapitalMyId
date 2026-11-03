@@ -6,27 +6,22 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	dbstore "github.com/rnpproject/algentra-backend/internal/database"
 	"net/http"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
-
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type paymentAPI struct {
-	pool                                 *pgxpool.Pool
+	pool                                 *dbstore.Pool
 	pricing                              ServicePricing
 	workerConfigured                     bool
 	bankName, paymentNumber, paymentName string
 	qrisAvailable                        bool
 	projectRoot                          string
-	midtransServerKey                    string
-	midtransMerchantID                   string
-	midtransProduction                   bool
-	midtransNotificationURL              string
+	airPayAPIKey                         string
+	airPayMerchantUID                    string
 	bot                                  *telegramPaymentBot
 }
 
@@ -35,11 +30,12 @@ type paymentOrderCreateRequest struct {
 	Server        string          `json:"server"`
 	Login         string          `json:"login"`
 	Plan          string          `json:"plan"`
+	RentalDays    int             `json:"rental_days"`
 	ExecutionMode json.RawMessage `json:"execution_mode"`
 }
 
 var paymentLoginPattern = regexp.MustCompile(`^\d+$`)
-var paymentPlanPattern = regexp.MustCompile(`^(ZERO|PRO|EXPERT|MANAGED|EA|EA_VPS[1-5])$`)
+var paymentPlanPattern = regexp.MustCompile(`^RENTAL$`)
 
 func (api paymentAPI) register(mux *http.ServeMux) {
 	for _, prefix := range []string{"/api/payments", "/v1/payments"} {
@@ -54,8 +50,6 @@ func (api paymentAPI) register(mux *http.ServeMux) {
 		mux.HandleFunc("POST "+prefix+"/orders/{order_id}/notify", api.retryNotification)
 		mux.HandleFunc("GET "+prefix+"/manual-instructions", api.manualInstructions)
 	}
-	mux.HandleFunc("POST /api/payments/midtrans/notification", api.midtransNotification)
-	mux.HandleFunc("POST /v1/payments/midtrans/notification", api.midtransNotification)
 	mux.HandleFunc("GET /api/payments/qris.jpeg", qrisUnavailable)
 	mux.HandleFunc("GET /v1/payments/qris.jpeg", qrisUnavailable)
 }
@@ -96,7 +90,7 @@ func (api paymentAPI) listOrders(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
-	rows, err := api.pool.Query(ctx, `SELECT id,email,label,server,login,plan,execution_mode,total_idr,status,payment_method,midtrans_status,proof_filename,account_id,admin_notified_at,created_at,updated_at FROM payment_orders WHERE owner_id=$1 ORDER BY id DESC LIMIT 20`, ownerID)
+	rows, err := api.pool.Query(ctx, `SELECT id,email,label,server,login,plan,execution_mode,total_idr,rental_days,status,payment_method,midtrans_status,proof_filename,account_id,admin_notified_at,created_at,updated_at FROM payment_orders WHERE owner_id=$1 ORDER BY id DESC LIMIT 20`, ownerID)
 	if err != nil {
 		writeError(w, 503, "Pesanan pembayaran tidak tersedia")
 		return
@@ -107,15 +101,16 @@ func (api paymentAPI) listOrders(w http.ResponseWriter, r *http.Request) {
 		var id int64
 		var email, label, server, login, plan, mode, status, method string
 		var amount int64
+		var rentalDays int
 		var midtrans, proof sql.NullString
 		var account sql.NullInt64
 		var notified sql.NullTime
 		var created, updated time.Time
-		if err := rows.Scan(&id, &email, &label, &server, &login, &plan, &mode, &amount, &status, &method, &midtrans, &proof, &account, &notified, &created, &updated); err != nil {
+		if err := rows.Scan(&id, &email, &label, &server, &login, &plan, &mode, &amount, &rentalDays, &status, &method, &midtrans, &proof, &account, &notified, &created, &updated); err != nil {
 			writeError(w, 503, "Pesanan pembayaran tidak dapat dibaca")
 			return
 		}
-		items = append(items, paymentOrderPayload(id, email, label, server, login, plan, mode, amount, status, method, midtrans, proof, account, notified, created, updated))
+		items = append(items, paymentOrderPayload(id, email, label, server, login, plan, mode, amount, rentalDays, status, method, midtrans, proof, account, notified, created, updated))
 	}
 	if err := rows.Err(); err != nil {
 		writeError(w, 503, "Pesanan pembayaran tidak dapat dibaca")
@@ -137,12 +132,19 @@ func (api paymentAPI) createOrder(w http.ResponseWriter, r *http.Request) {
 	p.Label = strings.TrimSpace(p.Label)
 	p.Server = strings.TrimSpace(p.Server)
 	p.Login = strings.TrimSpace(p.Login)
-	executionMode := "EA"
-	if p.ExecutionMode != nil {
+	executionMode := "MANAGED"
+	if p.Plan != "RENTAL" && p.ExecutionMode != nil {
 		if err := json.Unmarshal(p.ExecutionMode, &executionMode); err != nil {
 			writeError(w, 422, "Data pesanan tidak valid")
 			return
 		}
+	}
+	if p.Plan == "RENTAL" {
+		if p.RentalDays < 10 || p.RentalDays > 10000 {
+			writeError(w, 422, "Masa sewa minimal 10 hari.")
+			return
+		}
+		executionMode = "MANAGED"
 	}
 	if !validLength(p.Label, 1, 80) || !validLength(p.Server, 1, 128) || !validLength(p.Login, 1, 32) || !paymentLoginPattern.MatchString(p.Login) || !paymentPlanPattern.MatchString(p.Plan) || (executionMode != "EA" && executionMode != "MANAGED") {
 		writeError(w, 422, "Data pesanan tidak valid")
@@ -152,12 +154,12 @@ func (api paymentAPI) createOrder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 503, "Layanan managed copy belum dikonfigurasi di server.")
 		return
 	}
-	amount, exists := api.resolvePlan(p.Plan)
+	amount, exists := api.resolvePlan(p.Plan, p.RentalDays)
 	if !exists {
 		writeError(w, 409, "Paket layanan tidak dikenal")
 		return
 	}
-	if p.Plan == "MANAGED" && executionMode != "MANAGED" || (p.Plan == "EA" || strings.HasPrefix(p.Plan, "EA_VPS")) && executionMode != "EA" {
+	if executionMode != "MANAGED" {
 		writeError(w, 409, "Paket tidak sesuai dengan cara menjalankan copy trading")
 		return
 	}
@@ -169,13 +171,14 @@ func (api paymentAPI) createOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer tx.Rollback(ctx)
-	_, err = tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, "payment-owner:"+strconv.FormatInt(ownerID, 10))
+	// Reserve the SQLite writer transaction before checking account/order limits.
+	_, err = tx.Exec(ctx, `INSERT INTO auth_locks(lock_key) VALUES('writer') ON CONFLICT(lock_key) DO NOTHING`)
 	if err != nil {
 		writeError(w, 503, "Pesanan pembayaran tidak tersedia")
 		return
 	}
 	var email string
-	if err = tx.QueryRow(ctx, `SELECT email FROM client_users WHERE id=$1`, ownerID).Scan(&email); errors.Is(err, pgx.ErrNoRows) {
+	if err = tx.QueryRow(ctx, `SELECT email FROM client_users WHERE id=$1`, ownerID).Scan(&email); errors.Is(err, sql.ErrNoRows) {
 		writeError(w, 404, "Akun pengguna tidak ditemukan")
 		return
 	} else if err != nil {
@@ -183,7 +186,8 @@ func (api paymentAPI) createOrder(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var accountCount, reserved int64
-	if err = tx.QueryRow(ctx, `SELECT count(*) FROM mt5_accounts WHERE owner_id=$1`, ownerID).Scan(&accountCount); err != nil {
+	nowText := time.Now().UTC().Format(time.RFC3339Nano)
+	if err = tx.QueryRow(ctx, `SELECT count(*) FROM mt5_accounts WHERE owner_id=$1 AND (rental_expires_at IS NULL OR rental_expires_at>$2)`, ownerID, nowText).Scan(&accountCount); err != nil {
 		writeError(w, 503, "Akun pengguna tidak tersedia")
 		return
 	}
@@ -197,8 +201,8 @@ func (api paymentAPI) createOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	var duplicate bool
 	managed := executionMode == "MANAGED"
-	query := `SELECT EXISTS(SELECT 1 FROM mt5_accounts WHERE lower(server)=lower($1) AND login=$2 AND ($4::boolean OR owner_id=$3))`
-	if err = tx.QueryRow(ctx, query, p.Server, p.Login, ownerID, managed).Scan(&duplicate); err != nil {
+	query := `SELECT EXISTS(SELECT 1 FROM mt5_accounts WHERE lower(server)=lower($1) AND login=$2 AND (($4::boolean AND (NOT $5::boolean OR owner_id<>$3)) OR (NOT $4::boolean AND owner_id=$3)))`
+	if err = tx.QueryRow(ctx, query, p.Server, p.Login, ownerID, managed, p.Plan == "RENTAL").Scan(&duplicate); err != nil {
 		writeError(w, 503, "Akun broker tidak dapat diperiksa")
 		return
 	}
@@ -217,7 +221,7 @@ func (api paymentAPI) createOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	var id int64
 	now := time.Now().UTC()
-	err = tx.QueryRow(ctx, `INSERT INTO payment_orders(owner_id,email,label,server,login,plan,execution_mode,total_idr,status,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,'PENDING_PAYMENT',$9,$9) RETURNING id`, ownerID, email, p.Label, p.Server, p.Login, p.Plan, executionMode, amount, now).Scan(&id)
+	err = tx.QueryRow(ctx, `INSERT INTO payment_orders(owner_id,email,label,server,login,plan,execution_mode,total_idr,rental_days,status,created_at,updated_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,'PENDING_PAYMENT',$10,$10) RETURNING id`, ownerID, email, p.Label, p.Server, p.Login, p.Plan, executionMode, amount, p.RentalDays, now).Scan(&id)
 	if err != nil {
 		writeError(w, 503, "Pesanan pembayaran gagal disimpan")
 		return
@@ -229,11 +233,16 @@ func (api paymentAPI) createOrder(w http.ResponseWriter, r *http.Request) {
 	var nullString sql.NullString
 	var nullInt sql.NullInt64
 	var nullTime sql.NullTime
-	writeJSON(w, 200, paymentOrderPayload(id, email, p.Label, p.Server, p.Login, p.Plan, executionMode, amount, "PENDING_PAYMENT", "MANUAL", nullString, nullString, nullInt, nullTime, now, now))
+	writeJSON(w, 200, paymentOrderPayload(id, email, p.Label, p.Server, p.Login, p.Plan, executionMode, amount, p.RentalDays, "PENDING_PAYMENT", "MANUAL", nullString, nullString, nullInt, nullTime, now, now))
 }
 
-func (api paymentAPI) resolvePlan(code string) (int64, bool) {
+func (api paymentAPI) resolvePlan(code string, rentalDays ...int) (int64, bool) {
 	switch code {
+	case "RENTAL":
+		if len(rentalDays) != 1 || rentalDays[0] < 10 || rentalDays[0] > 10000 {
+			return 0, false
+		}
+		return int64(rentalDays[0]) * 2000, true
 	case "ZERO":
 		return 150000, true
 	case "PRO":
@@ -256,8 +265,8 @@ func (api paymentAPI) resolvePlan(code string) (int64, bool) {
 	return 0, false
 }
 
-func paymentOrderPayload(id int64, email, label, server, login, plan, mode string, amount int64, status, method string, midtrans, proof sql.NullString, account sql.NullInt64, notified sql.NullTime, created, updated time.Time) map[string]any {
-	return map[string]any{"id": id, "invoice_code": fmt.Sprintf("INV-AC%04d", id), "email": email, "label": label, "server": server, "login": login, "plan": plan, "execution_mode": mode, "total_idr": amount, "status": status, "payment_method": method, "midtrans_status": nullableString(midtrans), "has_proof": proof.Valid, "account_id": nullableInt(account), "notification_sent": notified.Valid, "created_at": wibTime(created), "updated_at": wibTime(updated)}
+func paymentOrderPayload(id int64, email, label, server, login, plan, mode string, amount int64, rentalDays int, status, method string, midtrans, proof sql.NullString, account sql.NullInt64, notified sql.NullTime, created, updated time.Time) map[string]any {
+	return map[string]any{"id": id, "invoice_code": fmt.Sprintf("INV-AC%04d", id), "email": email, "label": label, "server": server, "login": login, "plan": plan, "execution_mode": mode, "total_idr": amount, "rental_days": rentalDays, "status": status, "payment_method": method, "qris_status": nullableString(midtrans), "has_proof": proof.Valid, "account_id": nullableInt(account), "notification_sent": notified.Valid, "created_at": wibTime(created), "updated_at": wibTime(updated)}
 }
 
 func nullableInt(v sql.NullInt64) any {

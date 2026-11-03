@@ -3,6 +3,7 @@ package httpapi
 import (
 	"bytes"
 	"encoding/json"
+	dbstore "github.com/rnpproject/algentra-backend/internal/database"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -10,7 +11,6 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rnpproject/algentra-backend/internal/ea/snapshot"
 )
 
@@ -71,7 +71,7 @@ func (api dashboardAPI) dashboardWebSocket(w http.ResponseWriter, r *http.Reques
 	}
 }
 
-func publicPerformanceWebSocket(pool *pgxpool.Pool, state *snapshot.Store, allowedOrigins []string) http.HandlerFunc {
+func publicPerformanceWebSocket(pool *dbstore.Pool, state *snapshot.Store, allowedOrigins []string) http.HandlerFunc {
 	upgrader := websocket.Upgrader{
 		ReadBufferSize:  1024,
 		WriteBufferSize: 4096,

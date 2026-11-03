@@ -3,6 +3,7 @@ package httpapi
 import (
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -12,7 +13,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	telegramclient "github.com/rnpproject/algentra-backend/internal/telegram"
 	"golang.org/x/text/cases"
 )
@@ -42,7 +42,7 @@ func (api telegramAPI) processTelegramMessage(parent context.Context, message te
 	}
 	var displayName string
 	err := api.pool.QueryRow(ctx, `SELECT COALESCE(NULLIF(alias,''),name) FROM groups WHERE chat_id=$1 AND enabled=TRUE`, message.GroupID).Scan(&displayName)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
@@ -84,7 +84,7 @@ func (api telegramAPI) processTelegramMessage(parent context.Context, message te
 	if err == nil {
 		return nil
 	}
-	if !errors.Is(err, pgx.ErrNoRows) {
+	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
 	stamp := message.CreatedAt.UTC()
@@ -98,7 +98,7 @@ func (api telegramAPI) processTelegramMessage(parent context.Context, message te
 	if err == nil {
 		return nil
 	}
-	if !errors.Is(err, pgx.ErrNoRows) {
+	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
 	var prior *string
@@ -195,7 +195,7 @@ func (api telegramAPI) saveTelegramSignal(ctx context.Context, message telegramc
 	}
 	var insertedID int64
 	err = tx.QueryRow(ctx, `INSERT INTO signals(group_id,group_name,message_id,sender_id,sender_name,raw_text,parsed_json,normalized_text,confidence,content_hash,status,created_at) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12) ON CONFLICT DO NOTHING RETURNING id`, message.GroupID, displayName, message.MessageID, senderID, senderName, raw, parsedValue, normalizedValue, confidence, contentHash, status, stamp).Scan(&insertedID)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
 	if err != nil {

@@ -11,7 +11,9 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	dbstore "github.com/rnpproject/algentra-backend/internal/database"
 	"html"
+	"log/slog"
 	"math/big"
 	"net"
 	"net/http"
@@ -24,8 +26,6 @@ import (
 	"time"
 	"unicode"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rnpproject/algentra-backend/internal/auth"
 	"golang.org/x/text/cases"
 )
@@ -91,7 +91,7 @@ func configuredEmailSocials(contact ContactConfig) []emailSocialLink {
 }
 
 type authClientAPI struct {
-	pool      *pgxpool.Pool
+	pool      *dbstore.Pool
 	appSecret string
 	email     emailConfig
 }
@@ -156,8 +156,9 @@ type verificationRecord struct {
 	WindowStarted, LockedUntil sql.NullTime
 }
 
-func authLock(ctx context.Context, tx pgx.Tx, key string) error {
-	_, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1,0))`, key)
+func authLock(ctx context.Context, tx *dbstore.Tx, key string) error {
+	// This first write reserves SQLite's single writer slot for the transaction.
+	_, err := tx.Exec(ctx, `INSERT INTO auth_locks(lock_key) VALUES('writer') ON CONFLICT(lock_key) DO NOTHING`)
 	return err
 }
 func secondsUntil(deadline sql.NullTime, now time.Time) int {
@@ -246,7 +247,8 @@ func (api authClientAPI) registerClient(w http.ResponseWriter, r *http.Request) 
 	now := time.Now().UTC()
 	var pending verificationRecord
 	err = tx.QueryRow(ctx, `SELECT code_hash,password_hash,expires_at,resend_after,attempts,send_count,send_window_started_at,locked_until FROM email_verifications WHERE email=$1 FOR UPDATE`, email).Scan(&pending.CodeHash, &pending.PasswordHash, &pending.ExpiresAt, &pending.ResendAfter, &pending.Attempts, &pending.SendCount, &pending.WindowStarted, &pending.LockedUntil)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		slog.Error("registration: read existing verification failed", "error", err)
 		writeError(w, 503, "Data verifikasi tidak tersedia")
 		return
 	}
@@ -334,7 +336,7 @@ func (api authClientAPI) resendCode(w http.ResponseWriter, r *http.Request) {
 	}
 	var pending verificationRecord
 	err = tx.QueryRow(ctx, `SELECT code_hash,password_hash,expires_at,resend_after,attempts,send_count,send_window_started_at,locked_until FROM email_verifications WHERE email=$1 FOR UPDATE`, email).Scan(&pending.CodeHash, &pending.PasswordHash, &pending.ExpiresAt, &pending.ResendAfter, &pending.Attempts, &pending.SendCount, &pending.WindowStarted, &pending.LockedUntil)
-	if errors.Is(err, pgx.ErrNoRows) || existsUser {
+	if errors.Is(err, sql.ErrNoRows) || existsUser {
 		_ = tx.Rollback(ctx)
 		authRetryResponse(w, 60)
 		return
@@ -401,21 +403,24 @@ func (api authClientAPI) verifyEmail(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	tx, err := api.pool.Begin(ctx)
 	if err != nil {
+		slog.Error("email verification: begin transaction failed", "error", err)
 		writeError(w, 503, "Verifikasi tidak tersedia")
 		return
 	}
 	defer tx.Rollback(ctx)
 	if err = authLock(ctx, tx, "email-verification:"+email); err != nil {
+		slog.Error("email verification: acquire database lock failed", "error", err)
 		writeError(w, 503, "Verifikasi tidak tersedia")
 		return
 	}
 	var v verificationRecord
 	err = tx.QueryRow(ctx, `SELECT code_hash,password_hash,expires_at,resend_after,attempts,send_count,send_window_started_at,locked_until FROM email_verifications WHERE email=$1 FOR UPDATE`, email).Scan(&v.CodeHash, &v.PasswordHash, &v.ExpiresAt, &v.ResendAfter, &v.Attempts, &v.SendCount, &v.WindowStarted, &v.LockedUntil)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, 400, "Kode tidak valid atau kedaluwarsa")
 		return
 	}
 	if err != nil {
+		slog.Error("email verification: read code failed", "error", err)
 		writeError(w, 503, "Kode verifikasi tidak tersedia")
 		return
 	}
@@ -441,10 +446,12 @@ func (api authClientAPI) verifyEmail(w http.ResponseWriter, r *http.Request) {
 			lockUntil := now.Add(verificationWindow)
 			_, err = tx.Exec(ctx, `UPDATE email_verifications SET attempts=$2,locked_until=$3,resend_after=$3 WHERE email=$1`, email, v.Attempts, lockUntil)
 			if err != nil {
+				slog.Error("email verification: record attempt limit failed", "error", err)
 				writeError(w, 503, "Status verifikasi tidak dapat disimpan")
 				return
 			}
 			if err = tx.Commit(ctx); err != nil {
+				slog.Error("email verification: commit attempt limit failed", "error", err)
 				writeError(w, 503, "Status verifikasi tidak dapat disimpan")
 				return
 			}
@@ -454,10 +461,12 @@ func (api authClientAPI) verifyEmail(w http.ResponseWriter, r *http.Request) {
 		}
 		_, err = tx.Exec(ctx, `UPDATE email_verifications SET attempts=$2 WHERE email=$1`, email, v.Attempts)
 		if err != nil {
+			slog.Error("email verification: record failed attempt failed", "error", err)
 			writeError(w, 503, "Status verifikasi tidak dapat disimpan")
 			return
 		}
 		if err = tx.Commit(ctx); err != nil {
+			slog.Error("email verification: commit failed attempt failed", "error", err)
 			writeError(w, 503, "Status verifikasi tidak dapat disimpan")
 			return
 		}
@@ -466,19 +475,22 @@ func (api authClientAPI) verifyEmail(w http.ResponseWriter, r *http.Request) {
 	}
 	var userID int64
 	err = tx.QueryRow(ctx, `INSERT INTO client_users(email,password_hash,verified_at,created_at) VALUES($1,$2,$3,$3) ON CONFLICT(email) DO NOTHING RETURNING id`, email, v.PasswordHash, now).Scan(&userID)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, 409, "Akun dengan email tersebut sudah dibuat")
 		return
 	}
 	if err != nil {
+		slog.Error("email verification: create client account failed", "error", err)
 		writeError(w, 503, "Akun client tidak dapat dibuat")
 		return
 	}
 	if _, err = tx.Exec(ctx, `DELETE FROM email_verifications WHERE email=$1`, email); err != nil {
+		slog.Error("email verification: delete used code failed", "error", err)
 		writeError(w, 503, "Verifikasi tidak dapat diselesaikan")
 		return
 	}
 	if err = tx.Commit(ctx); err != nil {
+		slog.Error("email verification: commit failed", "error", err)
 		writeError(w, 503, "Verifikasi tidak dapat diselesaikan")
 		return
 	}
@@ -541,7 +553,7 @@ func (api authClientAPI) requestPasswordReset(w http.ResponseWriter, r *http.Req
 	var attempts, sends int
 	var window, locked sql.NullTime
 	err = tx.QueryRow(ctx, `SELECT code_hash,expires_at,resend_after,attempts,send_count,send_window_started_at,locked_until FROM password_reset_codes WHERE email_hash=$1 FOR UPDATE`, emailKey).Scan(&codeHash, &expiry, &resend, &attempts, &sends, &window, &locked)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		writeJSON(w, http.StatusAccepted, generic)
 		return
 	}
@@ -611,7 +623,7 @@ func (api authClientAPI) confirmPasswordReset(w http.ResponseWriter, r *http.Req
 	var attempts, sends int
 	var window, locked sql.NullTime
 	err = tx.QueryRow(ctx, `SELECT code_hash,expires_at,resend_after,attempts,send_count,send_window_started_at,locked_until FROM password_reset_codes WHERE email_hash=$1 FOR UPDATE`, emailKey).Scan(&stored, &expires, &resend, &attempts, &sends, &window, &locked)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, 400, "Kode tidak valid atau kedaluwarsa")
 		return
 	}
@@ -636,7 +648,7 @@ func (api authClientAPI) confirmPasswordReset(w http.ResponseWriter, r *http.Req
 	}
 	var userID int64
 	err = tx.QueryRow(ctx, `SELECT id FROM client_users WHERE email=$1 FOR UPDATE`, email).Scan(&userID)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		attempts++
 		api.persistResetFailure(ctx, tx, emailKey, attempts, now, w)
 		return
@@ -669,7 +681,7 @@ func (api authClientAPI) confirmPasswordReset(w http.ResponseWriter, r *http.Req
 	writeJSON(w, 200, map[string]string{"status": "password_reset"})
 }
 
-func (api authClientAPI) persistResetFailure(ctx context.Context, tx pgx.Tx, emailKey string, attempts int, now time.Time, w http.ResponseWriter) {
+func (api authClientAPI) persistResetFailure(ctx context.Context, tx *dbstore.Tx, emailKey string, attempts int, now time.Time, w http.ResponseWriter) {
 	if attempts >= verificationMaxAttempts {
 		until := now.Add(verificationWindow)
 		_, err := tx.Exec(ctx, `UPDATE password_reset_codes SET attempts=$2,locked_until=$3,resend_after=$3,last_activity_at=$4 WHERE email_hash=$1`, emailKey, attempts, until, now)

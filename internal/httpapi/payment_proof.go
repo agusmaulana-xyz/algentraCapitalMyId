@@ -6,16 +6,14 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	dbstore "github.com/rnpproject/algentra-backend/internal/database"
 	"io"
 	"net/http"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/jackc/pgx/v5"
 )
 
 const maxPaymentProofBytes = 5 << 20
@@ -55,7 +53,7 @@ func (api paymentAPI) getProof(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	var name string
 	err := api.pool.QueryRow(ctx, `SELECT proof_filename FROM payment_orders WHERE id=$1 AND owner_id=$2`, id, ownerID).Scan(&name)
-	if errors.Is(err, pgx.ErrNoRows) || name == "" {
+	if errors.Is(err, sql.ErrNoRows) || name == "" {
 		writeError(w, 404, "Nota atau bukti pembayaran tidak ditemukan")
 		return
 	}
@@ -163,7 +161,7 @@ func (api paymentAPI) submitProof(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback(ctx)
 	var status string
 	err = tx.QueryRow(ctx, `SELECT status FROM payment_orders WHERE id=$1 AND owner_id=$2 FOR UPDATE`, id, ownerID).Scan(&status)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		_ = os.Remove(path)
 		writeError(w, 404, "Pesanan tidak ditemukan")
 		return
@@ -217,10 +215,10 @@ func (api paymentAPI) cancelOrder(w http.ResponseWriter, r *http.Request) {
 	}
 	preflightCtx, preflightCancel := context.WithTimeout(r.Context(), 5*time.Second)
 	var preStatus, preMethod string
-	var preMidtrans sql.NullString
-	preErr := api.pool.QueryRow(preflightCtx, `SELECT status,payment_method,midtrans_order_id FROM payment_orders WHERE id=$1 AND owner_id=$2`, id, ownerID).Scan(&preStatus, &preMethod, &preMidtrans)
+	var preQRISID sql.NullString
+	preErr := api.pool.QueryRow(preflightCtx, `SELECT status,payment_method,midtrans_order_id FROM payment_orders WHERE id=$1 AND owner_id=$2`, id, ownerID).Scan(&preStatus, &preMethod, &preQRISID)
 	preflightCancel()
-	if errors.Is(preErr, pgx.ErrNoRows) {
+	if errors.Is(preErr, sql.ErrNoRows) {
 		writeError(w, 404, "Pesanan tidak ditemukan")
 		return
 	}
@@ -228,8 +226,8 @@ func (api paymentAPI) cancelOrder(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 503, "Pesanan pembayaran tidak tersedia")
 		return
 	}
-	if preStatus == "PENDING_PAYMENT" && preMethod == "QRIS" && preMidtrans.Valid {
-		if err := api.cancelQRISCharge(r.Context(), id, preMidtrans.String); err != nil {
+	if preStatus == "PENDING_PAYMENT" && preMethod == "QRIS" && preQRISID.Valid {
+		if err := api.cancelQRISCharge(r.Context(), id, preQRISID.String); err != nil {
 			var cancelErr *paymentCancelError
 			if errors.As(err, &cancelErr) {
 				writeError(w, cancelErr.status, cancelErr.message)
@@ -250,7 +248,7 @@ func (api paymentAPI) cancelOrder(w http.ResponseWriter, r *http.Request) {
 	var status, method string
 	var midtransID, proof sql.NullString
 	err = tx.QueryRow(ctx, `SELECT status,payment_method,midtrans_order_id,proof_filename FROM payment_orders WHERE id=$1 AND owner_id=$2 FOR UPDATE`, id, ownerID).Scan(&status, &method, &midtransID, &proof)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, 404, "Pesanan tidak ditemukan")
 		return
 	}
@@ -285,51 +283,38 @@ func (api paymentAPI) cancelOrder(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, 200, order)
 }
 
-func (api paymentAPI) cancelQRISCharge(parent context.Context, orderID int64, midtransID string) error {
-	if api.midtransServerKey == "" {
+func (api paymentAPI) cancelQRISCharge(parent context.Context, orderID int64, externalID string) error {
+	if api.airPayAPIKey == "" {
 		return &paymentCancelError{status: http.StatusConflict, message: "Pembayaran QRIS belum dikonfigurasi."}
 	}
-	ctx, cancel := context.WithTimeout(parent, 35*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 30*time.Second)
 	defer cancel()
-	data, code, err := api.midtransRequest(ctx, http.MethodPost, "/v2/"+url.PathEscape(midtransID)+"/cancel", nil)
-	if err != nil {
-		return &paymentCancelError{status: http.StatusBadGateway, message: "Tidak dapat membatalkan QRIS di Midtrans. Coba lagi sebentar."}
-	}
-	if code == 200 || code == 201 {
-		status := data.TransactionStatus
-		if status == "" {
-			status = "cancel"
-		}
-		_, err = api.pool.Exec(ctx, `UPDATE payment_orders SET midtrans_status=$2,updated_at=$3 WHERE id=$1 AND status='PENDING_PAYMENT'`, orderID, status, time.Now().UTC())
-		if err != nil {
-			return &paymentCancelError{status: http.StatusInternalServerError, message: "Status QRIS tidak dapat disimpan."}
-		}
-		return nil
-	}
-	state, statusCode, err := api.midtransRequest(ctx, http.MethodGet, "/v2/"+url.PathEscape(midtransID)+"/status", nil)
-	if err != nil || statusCode != 200 {
+	response, code, err := api.airPayRequest(ctx, "/api/qris/status", map[string]any{"transaction_id": externalID})
+	if err != nil || code < 200 || code >= 300 {
 		return &paymentCancelError{status: http.StatusBadGateway, message: "Status QRIS belum dapat dipastikan. Coba batalkan pesanan lagi."}
 	}
-	_, result, _, err := api.applyMidtransStatus(ctx, orderID, state)
+	data := response.result()
+	_, result, _, err := api.applyAirPayStatus(ctx, orderID, data)
 	if err != nil {
 		return &paymentCancelError{status: http.StatusInternalServerError, message: "Status QRIS tidak dapat diperbarui."}
 	}
 	if result != "PAYMENT_FAILED" {
-		return &paymentCancelError{status: http.StatusConflict, message: "Pembayaran sudah diproses dan pesanan tidak dapat dibatalkan."}
+		return &paymentCancelError{status: http.StatusConflict, message: "QRIS masih aktif atau pembayaran sudah diproses. Pesanan belum dapat dibatalkan."}
 	}
 	return nil
 }
 
-func loadPaymentOrder(ctx context.Context, tx pgx.Tx, id int64) (map[string]any, error) {
+func loadPaymentOrder(ctx context.Context, tx *dbstore.Tx, id int64) (map[string]any, error) {
 	var email, label, server, login, plan, mode, status, method string
 	var amount int64
+	var rentalDays int
 	var midtrans, proof sql.NullString
 	var account sql.NullInt64
 	var notified sql.NullTime
 	var created, updated time.Time
-	err := tx.QueryRow(ctx, `SELECT email,label,server,login,plan,execution_mode,total_idr,status,payment_method,midtrans_status,proof_filename,account_id,admin_notified_at,created_at,updated_at FROM payment_orders WHERE id=$1`, id).Scan(&email, &label, &server, &login, &plan, &mode, &amount, &status, &method, &midtrans, &proof, &account, &notified, &created, &updated)
+	err := tx.QueryRow(ctx, `SELECT email,label,server,login,plan,execution_mode,total_idr,rental_days,status,payment_method,midtrans_status,proof_filename,account_id,admin_notified_at,created_at,updated_at FROM payment_orders WHERE id=$1`, id).Scan(&email, &label, &server, &login, &plan, &mode, &amount, &rentalDays, &status, &method, &midtrans, &proof, &account, &notified, &created, &updated)
 	if err != nil {
 		return nil, err
 	}
-	return paymentOrderPayload(id, email, label, server, login, plan, mode, amount, status, method, midtrans, proof, account, notified, created, updated), nil
+	return paymentOrderPayload(id, email, label, server, login, plan, mode, amount, rentalDays, status, method, midtrans, proof, account, notified, created, updated), nil
 }

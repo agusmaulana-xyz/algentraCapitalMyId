@@ -6,12 +6,11 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	dbstore "github.com/rnpproject/algentra-backend/internal/database"
 	"math"
 	"net/http"
 	"strings"
 	"time"
-
-	"github.com/jackc/pgx/v5"
 )
 
 type tradeResultRequest struct {
@@ -35,7 +34,7 @@ func (api eaSignalAPI) result(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnprocessableEntity, "Ticket tidak valid")
 		return
 	}
-	closedAt, err := parseTradeResultTime(payload.ClosedAt)
+	parsedClosedAt, err := parseTradeResultTime(payload.ClosedAt)
 	if err != nil {
 		writeError(w, http.StatusUnprocessableEntity, "Waktu penutupan trade tidak valid")
 		return
@@ -54,7 +53,7 @@ func (api eaSignalAPI) result(w http.ResponseWriter, r *http.Request) {
 	var priorResult sql.NullString
 	err = tx.QueryRow(ctx, `SELECT id, signal_id, closed_at, result FROM trades WHERE ticket=$1 FOR UPDATE`, *ticket).
 		Scan(&tradeID, &signalID, &closedAt, &priorResult)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "Trade/ticket tidak ditemukan")
 		return
 	}
@@ -67,8 +66,8 @@ func (api eaSignalAPI) result(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	closed := time.Now().UTC()
-	if closedAt != nil {
-		closed = closedAt.UTC()
+	if parsedClosedAt != nil {
+		closed = parsedClosedAt.UTC()
 	}
 	if _, err := tx.Exec(ctx, `UPDATE trades SET profit=$2, result=$3, closed_at=$4 WHERE id=$1`, tradeID, payload.Profit, payload.Result, closed); err != nil {
 		writeError(w, http.StatusServiceUnavailable, "Trade tidak dapat ditutup")
@@ -81,7 +80,7 @@ func (api eaSignalAPI) result(w http.ResponseWriter, r *http.Request) {
 	}
 	if signalID.Valid {
 		var raw sql.NullString
-		if err := tx.QueryRow(ctx, `SELECT parsed_json FROM signals WHERE id=$1`, signalID.Int64).Scan(&raw); err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		if err := tx.QueryRow(ctx, `SELECT parsed_json FROM signals WHERE id=$1`, signalID.Int64).Scan(&raw); err != nil && !errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusServiceUnavailable, "Signal tidak tersedia")
 			return
 		}
@@ -140,13 +139,13 @@ func validTradeResult(p tradeResultRequest) bool {
 		!(p.Result == "WIN" && p.Profit <= 0) && !(p.Result == "LOSS" && p.Profit >= 0)
 }
 
-func syncClosedSignalStatus(ctx context.Context, tx pgx.Tx, signalID int64) error {
+func syncClosedSignalStatus(ctx context.Context, tx *dbstore.Tx, signalID int64) error {
 	var openTrade int64
 	err := tx.QueryRow(ctx, `SELECT id FROM trades WHERE signal_id=$1 AND closed_at IS NULL LIMIT 1`, signalID).Scan(&openTrade)
 	if err == nil {
 		return nil
 	}
-	if !errors.Is(err, pgx.ErrNoRows) {
+	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
 	rows, err := tx.Query(ctx, `SELECT result,profit FROM trades WHERE signal_id=$1`, signalID)

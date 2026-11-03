@@ -53,6 +53,10 @@ func requestLimit(path string) (int, time.Duration) {
 	case "/api/cs/chat/message":
 		return 12, time.Minute
 	default:
+		// Authenticated local worker traffic (jobs, status, account reports).
+		if strings.HasPrefix(path, "/api/mt5/copier/") {
+			return 1800, time.Minute
+		}
 		if strings.HasPrefix(path, "/api/telegram/") {
 			return 12, time.Minute
 		}

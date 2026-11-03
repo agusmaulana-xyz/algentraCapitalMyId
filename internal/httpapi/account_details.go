@@ -5,16 +5,14 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	dbstore "github.com/rnpproject/algentra-backend/internal/database"
 	"math"
 	"net/http"
 	"strconv"
 	"time"
-
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
-type mt5AccountDetailsAPI struct{ pool *pgxpool.Pool }
+type mt5AccountDetailsAPI struct{ pool *dbstore.Pool }
 
 func (api clientMT5API) accountDetails(w http.ResponseWriter, r *http.Request) {
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
@@ -30,7 +28,7 @@ func (api clientMT5API) accountDetails(w http.ResponseWriter, r *http.Request) {
 	}
 	page := accountHistoryPage(r)
 	data, err := loadAccountDetails(ctx, api.pool, id, &ownerID, page)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, 404, "Akun MT5 tidak ditemukan")
 		return
 	}
@@ -83,7 +81,7 @@ func (api mt5AccountDetailsAPI) details(w http.ResponseWriter, r *http.Request) 
 	}
 	page := accountHistoryPage(r)
 	data, err := loadAccountDetails(ctx, api.pool, id, nil, page)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, 404, "Akun MT5 tidak ditemukan")
 		return
 	}
@@ -112,7 +110,7 @@ func accountHistoryPage(r *http.Request) int {
 	return min(page, 1_000_000)
 }
 
-func loadAccountDetails(ctx context.Context, pool *pgxpool.Pool, id int64, ownerID *int64, page int) (map[string]any, error) {
+func loadAccountDetails(ctx context.Context, pool *dbstore.Pool, id int64, ownerID *int64, page int) (map[string]any, error) {
 	query := `SELECT a.id,a.label,a.server,a.login,a.plan,a.execution_mode,a.active,a.last_seen_at,s.balance,s.equity,s.floating_profit,s.margin,s.free_margin,s.currency,s.trade_mode,s.terminal_trade_allowed,s.expert_trade_allowed,s.open_position_ids_json,s.observed_at FROM mt5_accounts a LEFT JOIN mt5_account_state s ON s.account_id=a.id WHERE a.id=$1 AND a.role='follower'`
 	args := []any{id}
 	if ownerID != nil {
@@ -136,25 +134,67 @@ func loadAccountDetails(ctx context.Context, pool *pgxpool.Pool, id int64, owner
 		return nil, err
 	}
 	var historyTotal int
-	if err := pool.QueryRow(ctx, `SELECT count(*) FROM mt5_history_deals WHERE account_id=$1`, id).Scan(&historyTotal); err != nil {
+	if err := pool.QueryRow(ctx, `SELECT count(DISTINCT COALESCE(NULLIF(position_id,''),deal_ticket)) FROM mt5_history_deals WHERE account_id=$1`, id).Scan(&historyTotal); err != nil {
 		return nil, err
 	}
 	pageCount := max(1, int(math.Ceil(float64(historyTotal)/5)))
 	page = min(page, pageCount)
-	rows, err := pool.Query(ctx, `SELECT deal_ticket,deal_time,symbol,action,entry,volume,price,profit,commission,swap,fee FROM mt5_history_deals WHERE account_id=$1 ORDER BY deal_time_msc DESC,id DESC LIMIT 5 OFFSET $2`, id, (page-1)*5)
+	// One row per position (like MT5's Positions history): the closing deal of a
+	// BUY is a SELL, so deals are grouped and the direction comes from the opening deal.
+	rows, err := pool.Query(ctx, `
+		SELECT k, MIN(symbol),
+		       COALESCE(MAX(CASE WHEN entry='IN' THEN action END),''),
+		       COALESCE(MAX(CASE WHEN entry<>'IN' THEN action END),''),
+		       SUM(CASE WHEN entry='IN' THEN volume ELSE 0 END),
+		       SUM(CASE WHEN entry<>'IN' THEN volume ELSE 0 END),
+		       SUM(CASE WHEN entry='IN' THEN price*volume ELSE 0 END),
+		       SUM(CASE WHEN entry<>'IN' THEN price*volume ELSE 0 END),
+		       MIN(CASE WHEN entry='IN' THEN deal_time_msc END),
+		       MAX(CASE WHEN entry<>'IN' THEN deal_time_msc END),
+		       SUM(profit), SUM(commission), SUM(swap), SUM(fee)
+		FROM (SELECT COALESCE(NULLIF(position_id,''),deal_ticket) AS k, * FROM mt5_history_deals WHERE account_id=$1)
+		GROUP BY k
+		ORDER BY MAX(deal_time_msc) DESC, k DESC
+		LIMIT 5 OFFSET $2`, id, (page-1)*5)
 	if err != nil {
 		return nil, err
 	}
 	history := make([]map[string]any, 0)
 	for rows.Next() {
-		var ticket, symbol, action, entry string
-		var at time.Time
-		var volume, price, profit, commission, swap, fee float64
-		if err := rows.Scan(&ticket, &at, &symbol, &action, &entry, &volume, &price, &profit, &commission, &swap, &fee); err != nil {
+		var ticket, symbol, openAction, closeAction string
+		var volIn, volOut, valueIn, valueOut, profit, commission, swap, fee float64
+		var openMSC, closeMSC sql.NullInt64
+		if err := rows.Scan(&ticket, &symbol, &openAction, &closeAction, &volIn, &volOut, &valueIn, &valueOut, &openMSC, &closeMSC, &profit, &commission, &swap, &fee); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		history = append(history, map[string]any{"ticket": ticket, "time": at.In(wib).Format(time.RFC3339Nano), "symbol": symbol, "action": action, "entry": entry, "volume": volume, "price": price, "profit": profit, "commission": commission, "swap": swap, "fee": fee, "net_profit": profit + commission + swap + fee})
+		action, volume := openAction, volIn
+		if action == "" {
+			// Opened before the reported history window: derive from the closing deal.
+			if closeAction == "SELL" {
+				action = "BUY"
+			} else if closeAction == "BUY" {
+				action = "SELL"
+			}
+		}
+		if volume <= 0 {
+			volume = volOut
+		}
+		item := map[string]any{"ticket": ticket, "symbol": symbol, "action": action, "volume": volume, "open_time": nil, "close_time": nil, "open_price": nil, "close_price": nil, "status": "OPEN", "profit": profit, "commission": commission, "swap": swap, "fee": fee, "net_profit": profit + commission + swap + fee}
+		if openMSC.Valid {
+			item["open_time"] = time.UnixMilli(openMSC.Int64).In(wib).Format(time.RFC3339Nano)
+		}
+		if volIn > 0 {
+			item["open_price"] = valueIn / volIn
+		}
+		if closeMSC.Valid {
+			item["close_time"] = time.UnixMilli(closeMSC.Int64).In(wib).Format(time.RFC3339Nano)
+			item["status"] = "CLOSED"
+			if volOut > 0 {
+				item["close_price"] = valueOut / volOut
+			}
+		}
+		history = append(history, item)
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
@@ -168,7 +208,7 @@ func loadAccountDetails(ctx context.Context, pool *pgxpool.Pool, id int64, owner
 	return map[string]any{"id": aid, "label": label, "server": server, "login": login, "plan": plan, "execution_mode": mode, "active": active, "last_seen_at": nullableWIB(last, wib), "balance": nullableFloat(balance), "equity": nullableFloat(equity), "floating_profit": nullableFloat(floating), "margin": nullableFloat(margin), "free_margin": nullableFloat(free), "currency": nullableString(currency), "trade_mode": nullableString(tradeMode), "terminal_trade_allowed": nullableBool(terminal), "expert_trade_allowed": nullableBool(expert), "open_positions": len(positions), "state_updated_at": nullableWIB(observed, wib), "daily_profit": days, "history": history, "history_page": page, "history_pages": pageCount, "history_total": historyTotal}, nil
 }
 
-func accountDailyProfit(ctx context.Context, pool *pgxpool.Pool, id int64, currency string) ([]map[string]any, error) {
+func accountDailyProfit(ctx context.Context, pool *dbstore.Pool, id int64, currency string) ([]map[string]any, error) {
 	zone := time.FixedZone("WIB", 7*60*60)
 	now := time.Now().In(zone)
 	first := time.Date(now.Year(), now.Month(), now.Day(), 0, 0, 0, 0, zone).AddDate(0, 0, -6)
@@ -206,7 +246,7 @@ func accountDailyProfit(ctx context.Context, pool *pgxpool.Pool, id int64, curre
 	return out, nil
 }
 
-func refreshAccountDailyProfit(ctx context.Context, tx pgx.Tx, accountID int64, deals []followerDeal, currency string, now time.Time) error {
+func refreshAccountDailyProfit(ctx context.Context, tx *dbstore.Tx, accountID int64, deals []followerDeal, currency string, now time.Time) error {
 	if len(deals) == 0 {
 		return nil
 	}

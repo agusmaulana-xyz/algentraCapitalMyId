@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	dbstore "github.com/rnpproject/algentra-backend/internal/database"
 	"math"
 	"net/http"
 	"os"
@@ -12,13 +13,12 @@ import (
 	"regexp"
 	"strings"
 	"time"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type settingsAPI struct {
-	pool         *pgxpool.Pool
+	pool         *dbstore.Pool
 	appEnv       string
+	eaAPIKey     string
 	geminiAPIKey string
 	geminiModel  string
 }
@@ -29,9 +29,23 @@ var geminiModelPattern = regexp.MustCompile(`^[A-Za-z0-9._-]+$`)
 func (api settingsAPI) register(mux *http.ServeMux) {
 	for _, prefix := range []string{"/api/settings", "/v1/settings"} {
 		mux.HandleFunc("GET "+prefix, api.read)
+		mux.HandleFunc("GET "+prefix+"/ea-api-key", api.readEAAPIKey)
 		mux.HandleFunc("PUT "+prefix, api.update)
 		mux.HandleFunc("PUT "+prefix+"/gemini-config", api.updateGemini)
 	}
+}
+
+func (api settingsAPI) readEAAPIKey(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+	if _, ok := requireAdmin(ctx, api.pool, w, r); !ok {
+		return
+	}
+	w.Header().Set("Cache-Control", "private, no-store")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"configured": strings.TrimSpace(api.eaAPIKey) != "",
+		"api_key":    api.eaAPIKey,
+	})
 }
 
 func (api settingsAPI) read(w http.ResponseWriter, r *http.Request) {
@@ -203,7 +217,7 @@ func validateSetting(key string, value any) (any, error) {
 	}
 }
 
-func requireAdmin(ctx context.Context, pool *pgxpool.Pool, w http.ResponseWriter, r *http.Request) (string, bool) {
+func requireAdmin(ctx context.Context, pool *dbstore.Pool, w http.ResponseWriter, r *http.Request) (string, bool) {
 	state := SessionFromRequest(r)
 	if state == nil {
 		writeError(w, http.StatusUnauthorized, "Login admin diperlukan")

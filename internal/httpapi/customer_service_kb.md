@@ -20,7 +20,7 @@ Riwayat chat tersimpan agar ALGENTRA tetap nyambung saat pelanggan membuka ulang
 
 Chat tidak pernah menampilkan token EA atau API key. Jika klien kehilangan token, arahkan untuk membuat atau merotasi token lewat Portal Klien; token mentah hanya ditampilkan satu kali saat tindakan itu berhasil.
 
-Chat memakai Gemini dengan kredensial **`GEMINI_CS_API_KEY` yang berbeda dari key parser sinyal**. Jika chat menampilkan pesan belum tersedia, integrasi CS belum dikonfigurasi atau layanan Gemini sedang gagal; jangan menyuruh pelanggan mengirim key Gemini mereka.
+Chat dan parser sinyal memakai `GEMINI_API_KEY` serta `GEMINI_MODEL` yang sama. Jika chat menampilkan pesan belum tersedia, integrasi Gemini belum dikonfigurasi atau layanan sedang gagal; jangan menyuruh pelanggan mengirim key Gemini mereka.
 
 ## Halaman dan alamat
 
@@ -60,11 +60,11 @@ Situs juga menyediakan pilihan tema terang/gelap dan tombol musik latar.
 
 ### 3. Portal klien
 
-Pelanggan dapat mendaftarkan hingga **10 akun follower MT5**, memberi nama, melihat status koneksi, mengubah detail akun, menonaktifkan/mengaktifkan akun, merotasi token, atau menghapus akun. Saat menambahkan akun dan membuat token, pelanggan memilih level ZERO, PRO, atau EXPERT untuk akun MT5 itu. ALGENTRA dapat melihat level akun yang terhubung ke sesi klien tersebut.
+Pelanggan dapat menyewa server MT5 harian dengan minimum 10 hari, melihat status koneksi, mengganti server/nomor login akun saat copy dijeda, atau menghapus akun. Jika server atau nomor login diubah, password broker lama dihapus; pelanggan perlu memasukkan password akun baru dan menyimpan pengaturan supaya worker memeriksa login lagi. Perubahan identitas juga membersihkan riwayat dan snapshot lama dari akun sebelumnya.
 
 Portal dapat menampilkan saldo, equity, floating profit, jenis akun yang dilaporkan MT5, serta hasil transaksi tertutup, jumlah transaksi menang/kalah, dan win rate. Data ini berasal dari laporan EA MT5. Mata uang yang berbeda ditampilkan terpisah, tidak dikonversi menjadi satu mata uang.
 
-Portal membutuhkan server broker yang tepat dan nomor login MT5 untuk mendaftarkan akun. Kolom server menyediakan pencarian broker/server dan pilihan hasil; cocokkan pilihan dengan detail akun dari broker. **Portal tidak meminta kata sandi broker untuk mode Pasang EA sendiri.** EA mengirim laporan saldo dan histori transaksi MT5 agar data akun dapat ditampilkan.
+Portal memerlukan nama server dan nomor login yang persis sesuai detail akun broker. Terminal dapat menampilkan alamat endpoint broker, yang mungkin berbeda bentuk dari nama server pilihan tetapi mengarah ke server yang sama. Setelah pembayaran sewa, pelanggan memilih EA server atau mengunggah file `.mq5`/`.ex5` maksimal 10 MB. Password trading diminta untuk pemeriksaan login dan disimpan terenkripsi; jangan pernah mengirimkannya melalui chat.
 
 Token EA hanya ditampilkan saat dibuat atau dirotasi. Rotasi membuat token lama tidak berlaku; pelanggan harus segera memasukkan token baru ke EA follower. Penghapusan atau penonaktifan koneksi portal tidak menutup posisi terbuka di MT5. Posisi tersebut harus dikelola terpisah di terminal broker.
 
@@ -89,11 +89,11 @@ Jika tombol daftar tidak tersedia dan beranda menampilkan hitung mundur, pendaft
 
 ### B. Menambahkan akun follower MT5
 
-1. Masuk, lalu buka **Akun Copy Trading MT5** (`/account`).
-2. Saat menambahkan akun, pilih level untuk akun MT5 tersebut: **ZERO** (1 vCPU, RAM 1 GB, disk 20 GB) seharga **Rp 150.000**; **PRO** (2 vCPU, RAM 4 GB, disk 40 GB) seharga **Rp 200.000**; atau **EXPERT** (4 vCPU, RAM 8 GB, disk 80 GB) seharga **Rp 300.000**. Periode penagihan tidak ditentukan pada informasi yang tersedia.
-3. Isi nama akun (label), cari broker atau nama server lalu pilih server yang cocok dengan detail akun MT5, dan masukkan nomor login. Pembelian paket dan pembayaran saat ini belum tersedia; jangan melakukan transfer.
-4. Riwayat transaksi hanya menampilkan pesanan lama, nota, dan bukti pembayaran yang telah tersimpan. Pesanan lama yang belum dibayar dapat dibatalkan. Jika sudah terlanjur transfer, hubungi admin; jangan mengunggah bukti melalui portal karena fitur pembayaran sedang dinonaktifkan.
-5. Maksimal 10 akun/pesanan aktif per akun portal.
+1. Masuk, lalu buka **Sewa Server MT5** (`/account`).
+2. Pilih lama sewa minimal 10 hari dengan tarif Rp2.000 per hari, isi nama akun, pilih server broker yang tepat, dan masukkan nomor login.
+3. Selesaikan pembayaran pada halaman transaksi. Masa sewa dimulai setelah pembayaran disetujui.
+4. Setelah pembayaran, pilih EA server atau unggah EA sendiri berformat `.mq5` atau `.ex5` maksimal 10 MB. Worker mengompilasi file `.mq5` dan memasang EA pada terminal sewa.
+5. Masukkan password trading pada pengaturan akun dan simpan untuk pemeriksaan login. Jika salah server atau nomor login, jeda copy lalu buka **Ganti akun login MT5**, ubah server/login, masukkan password yang benar, dan simpan pengaturan ulang. Periksa juga bahwa endpoint MT5 yang terlihat di terminal bisa berupa alamat teknis untuk nama server pilihan.
 
 Jangan memasukkan atau mengirim kata sandi broker kepada customer service.
 

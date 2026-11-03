@@ -1,22 +1,7 @@
 import type { Metadata, Viewport } from "next";
-import { Poppins, Plus_Jakarta_Sans } from "next/font/google";
 import Script from "next/script";
 import { InitialApiLoading } from "./components/InitialApiLoading";
 import "./globals.css";
-
-const poppins = Poppins({
-  subsets: ["latin"],
-  weight: ["400", "600", "700", "800"],
-  variable: "--font-heading",
-  display: "swap",
-});
-
-const plusJakartaSans = Plus_Jakarta_Sans({
-  subsets: ["latin"],
-  weight: ["400", "500", "600", "700", "800"],
-  variable: "--font-body",
-  display: "swap",
-});
 
 export const metadata: Metadata = {
   title: "Algentra Capital | AI Copy Trading",
@@ -65,9 +50,8 @@ export default function RootLayout({
       lang="id"
       data-theme="dark"
       suppressHydrationWarning
-      className={`${poppins.variable} ${plusJakartaSans.variable}`}
     >
-      <body className={plusJakartaSans.className}>
+      <body>
         <InitialApiLoading />
         <Script
           id="theme-init"

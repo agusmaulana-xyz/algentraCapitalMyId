@@ -22,9 +22,10 @@ type PaymentOrder = {
   plan: string;
   execution_mode: string;
   total_idr: number;
+  rental_days?: number;
   status: string;
   payment_method: string;
-  midtrans_status: string | null;
+  qris_status: string | null;
   created_at: string;
   has_proof: boolean;
   notification_sent: boolean;
@@ -32,7 +33,7 @@ type PaymentOrder = {
 
 type QrisCharge = {
   order_id: number;
-  midtrans_order_id: string;
+  airpay_external_id: string;
   qr_code_url: string;
   gross_amount: number;
 };
@@ -81,9 +82,10 @@ function OrderDetails({ order, plans }: { order: PaymentOrder; plans: Record<str
     ["Kode invoice", order.invoice_code || `INV-AC${String(order.id).padStart(4, "0")}`],
     ["Tanggal", orderDate(order.created_at)],
     ["Nama akun", order.label],
+    ...(order.plan === "RENTAL" ? [["Masa sewa", `${order.rental_days || 10} hari`] as [string, string]] : []),
   ];
   const serviceRows: Array<[string, string]> = [
-    ["Mode layanan", order.execution_mode === "MANAGED" ? "Dikelola server" : "Pasang EA di MT5 sendiri"],
+    ["Mode layanan", order.plan === "RENTAL" ? "Sewa server MT5" : order.execution_mode === "MANAGED" ? "Dikelola server" : "Pasang EA di MT5 sendiri"],
     ["Login broker", `${order.login} · ${order.server}`],
     ["Metode bayar", paymentMethodName(order.payment_method)],
   ];
@@ -168,11 +170,15 @@ function QrisPayment({ order, onRefresh }: { order: PaymentOrder; onRefresh: () 
         setSyncMessage("QRIS dibatalkan atau kedaluwarsa. Buat kode QR baru untuk mencoba lagi.");
       } else if (!automatic) {
         setSyncMessage(
-          "Pembayaran belum terdeteksi di Midtrans. Jika Anda sudah membayar, tunggu sebentar lalu coba lagi."
+          "Pembayaran belum terdeteksi di AirPay. Jika Anda sudah membayar, tunggu sebentar lalu coba lagi."
         );
       }
     } catch (err) {
-      if (!automatic) setError(err instanceof Error ? err.message : "Gagal memeriksa status.");
+      if (automatic) {
+        setSyncMessage("Status QRIS sementara tidak dapat diperiksa. Sistem akan mencoba kembali otomatis.");
+      } else {
+        setError(err instanceof Error ? err.message : "Gagal memeriksa status.");
+      }
     } finally {
       syncInFlightRef.current = false;
       setSyncing(false);
@@ -185,11 +191,10 @@ function QrisPayment({ order, onRefresh }: { order: PaymentOrder; onRefresh: () 
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [order.id]);
 
-  // Cek langsung ke Midtrans selama QR tampil agar pembatalan/kedaluwarsa
-  // di provider segera melepas QR lokal, termasuk saat webhook tidak terkirim.
+  // Poll status AirPay karena dokumentasi provider tidak menyediakan webhook.
   useEffect(() => {
     if (!charge) return;
-    const timer = setInterval(() => void syncStatus(true), 5000);
+    const timer = setInterval(() => void syncStatus(true), 15000);
     return () => clearInterval(timer);
   }, [charge, order.id]);
 
@@ -651,7 +656,7 @@ function TransactionsPanelInner() {
                   {/* eslint-disable-next-line @next/next/no-img-element */}
                   <img
                     className="receipt-proof"
-                    src={`/api/core/payments/orders/${receiptOrder.id}/proof`}
+                    src={`/api/payments/orders/${receiptOrder.id}/proof`}
                     alt={`Bukti pembayaran untuk transaksi ${receiptOrder.id}`}
                   />
                 </>

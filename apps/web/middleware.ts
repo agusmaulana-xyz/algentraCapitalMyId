@@ -4,7 +4,7 @@ import { NextRequest, NextResponse } from "next/server";
  * Gerbang pemeliharaan.
  *
  * Sebelumnya middleware ini memanggil `/health` Core API pada SETIAP request
- * (halaman, aset statis, setiap panggilan /api/core, prefetch, polling 2 detik).
+ * (halaman, aset statis, setiap panggilan /api, prefetch, polling 2 detik).
  * Akibatnya: tiap aksi menunggu 1 round-trip tambahan, beban ke backend berlipat,
  * dan satu probe yang lambat (>2,5 dtk) langsung menampilkan "pemeliharaan"
  * walau backend sebenarnya normal.
@@ -81,7 +81,7 @@ function maintenanceResponse(status: number, detail: string): Response {
       <div class="eyebrow">Algentra Capital</div>
       <h1>Kami sedang melakukan pemeliharaan</h1>
       <p>${API_UNAVAILABLE_MESSAGE}</p>
-      <div class="status"><span class="dot" aria-hidden="true"></span><span id="state">Memeriksa ulang otomatis setiap 10 detik…</span></div>
+      <div class="status"><span class="dot" aria-hidden="true"></span><span id="state">Memeriksa ulang otomatis setiap 10 detikâ€¦</span></div>
       <div class="actions"><button type="button" onclick="location.reload()">Coba lagi</button></div>
       ${diagnostics}
     </main>
@@ -103,14 +103,8 @@ async function probe(): Promise<Health> {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), PROBE_TIMEOUT_MS);
   try {
-    const origin = process.env.CORE_API_ORIGIN ?? "http://127.0.0.1:8000";
+    const origin = "http://127.0.0.1:8000";
     const headers = new Headers({ accept: "application/json" });
-    const accessId = process.env.CF_ACCESS_CLIENT_ID;
-    const accessSecret = process.env.CF_ACCESS_CLIENT_SECRET;
-    if (accessId && accessSecret) {
-      headers.set("cf-access-client-id", accessId);
-      headers.set("cf-access-client-secret", accessSecret);
-    }
     const response = await fetch(new URL("/health", origin), {
       method: "GET",
       headers,
@@ -127,7 +121,7 @@ async function probe(): Promise<Health> {
       };
     }
     // 2xx/3xx/4xx = Core API menjawab. 4xx (mis. Cloudflare Access / rute /health dibatasi)
-    // bukan alasan menutup situs; proxy /api/core melaporkan masalah auth sendiri.
+    // bukan alasan menutup situs; proxy /api melaporkan masalah auth sendiri.
     return { down: false, status: response.status, detail: "", expires: Date.now() + UP_TTL_MS };
   } catch (error) {
     // Timeout / error jaringan: ambigu -> fail-open.

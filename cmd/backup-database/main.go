@@ -1,338 +1,294 @@
 package main
 
 import (
+	"archive/zip"
 	"context"
-	"database/sql"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
-	"net/url"
+	"github.com/rnpproject/algentra-backend/internal/database"
+	"io"
+	"mime/multipart"
+	"net/http"
 	"os"
-	"os/exec"
 	"path/filepath"
-	"regexp"
-	"sort"
 	"strings"
 	"time"
-
-	_ "modernc.org/sqlite"
 )
 
-const keepBackups = 14
-
-var sqliteBackupName = regexp.MustCompile(`^algentra-app-\d{8}T\d{6}Z\.db$`)
-var postgresBackupName = regexp.MustCompile(`^algentra-postgres-\d{8}T\d{6}Z\.dump\.age$`)
+const telegramLimit = 49 * 1024 * 1024
 
 func main() {
-	if err := createBackup(); err != nil {
+	if len(os.Args) == 3 && os.Args[1] == "-kill-switch" {
+		if err := setKillSwitch(os.Args[2]); err != nil {
+			fmt.Fprintln(os.Stderr, "kill switch gagal:", err)
+			os.Exit(1)
+		}
+		return
+	}
+	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "backup gagal:", err)
 		os.Exit(1)
 	}
 }
 
-func createBackup() error {
-	root, err := projectRoot()
+func setKillSwitch(value string) error {
+	if value != "on" && value != "off" {
+		return errors.New("gunakan -kill-switch on atau off")
+	}
+	databaseFile := resolveDatabaseFile()
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	db, err := database.Open(ctx, databaseFile)
 	if err != nil {
 		return err
-	}
-	if resolved, e := filepath.EvalSymlinks(root); e == nil {
-		root = resolved
-	}
-	backupValue := strings.TrimSpace(os.Getenv("BACKUP_DIR"))
-	if backupValue == "" {
-		return errors.New("BACKUP_DIR wajib diarahkan ke lokasi backup persisten")
-	}
-	backupDir, err := filepath.Abs(expandHome(backupValue))
-	if err != nil {
-		return err
-	}
-	if err = os.MkdirAll(backupDir, 0o700); err != nil {
-		return fmt.Errorf("folder backup tidak dapat dibuat: %w", err)
-	}
-	if resolved, e := filepath.EvalSymlinks(backupDir); e == nil {
-		backupDir = resolved
-	}
-	if withinPath(root, backupDir) {
-		return errors.New("BACKUP_DIR harus berada di luar folder aplikasi")
-	}
-	databaseURL := strings.TrimSpace(os.Getenv("DATABASE_URL"))
-	if databaseURL == "" {
-		return errors.New("DATABASE_URL wajib diisi")
-	}
-	if strings.EqualFold(strings.TrimSpace(os.Getenv("APP_ENV")), "production") {
-		runtime, err := parsePostgresURL(databaseURL)
-		if err != nil {
-			return fmt.Errorf("DATABASE_URL tidak valid: %w", err)
-		}
-		if strings.ToLower(strings.SplitN(runtime.User.Username(), ".", 2)[0]) != "algentra_api" {
-			return errors.New("DATABASE_URL harus memakai role runtime algentra_api")
-		}
-		projectRef := strings.TrimSpace(os.Getenv("SUPABASE_PROJECT_REF"))
-		if projectRef == "" {
-			return errors.New("SUPABASE_PROJECT_REF wajib diisi di production untuk memeriksa target backup")
-		}
-		identity := strings.ToLower(runtime.Hostname() + " " + runtime.User.Username())
-		if !strings.Contains(identity, strings.ToLower(projectRef)) {
-			return errors.New("DATABASE_URL harus menunjuk project Supabase yang cocok dengan SUPABASE_PROJECT_REF")
-		}
-	}
-	stamp := time.Now().UTC().Format("20060102T150405Z")
-	switch strings.ToLower(mustURLScheme(databaseURL)) {
-	case "sqlite":
-		destination := filepath.Join(backupDir, "algentra-app-"+stamp+".db")
-		if err = createSQLiteBackup(databaseURL, backupDir, destination); err != nil {
-			return err
-		}
-		if err = rotateBackups(backupDir, sqliteBackupName); err != nil {
-			return err
-		}
-		fmt.Println(destination)
-		return nil
-	case "postgres", "postgresql", "postgresql+psycopg":
-		destination := filepath.Join(backupDir, "algentra-postgres-"+stamp+".dump.age")
-		if err = createPostgresBackup(databaseURL, destination); err != nil {
-			return err
-		}
-		if err = rotateBackups(backupDir, postgresBackupName); err != nil {
-			return err
-		}
-		fmt.Println(destination)
-		return nil
-	default:
-		return errors.New("DATABASE_URL harus memakai PostgreSQL Supabase atau SQLite development")
-	}
-}
-
-func mustURLScheme(value string) string {
-	u, err := url.Parse(value)
-	if err != nil {
-		return ""
-	}
-	return u.Scheme
-}
-func projectRoot() (string, error) {
-	if value := strings.TrimSpace(os.Getenv("PROJECT_ROOT")); value != "" {
-		return filepath.Abs(value)
-	}
-	cwd, err := os.Getwd()
-	if err != nil {
-		return "", err
-	}
-	current := cwd
-	for {
-		if _, err = os.Stat(filepath.Join(current, "go.mod")); err == nil {
-			return filepath.Abs(current)
-		}
-		parent := filepath.Dir(current)
-		if parent == current {
-			break
-		}
-		current = parent
-	}
-	return filepath.Abs(cwd)
-}
-func expandHome(path string) string {
-	if path == "~" || strings.HasPrefix(path, "~/") || strings.HasPrefix(path, "~\\") {
-		if home, err := os.UserHomeDir(); err == nil {
-			return filepath.Join(home, strings.TrimLeft(path[1:], "/\\"))
-		}
-	}
-	return path
-}
-func withinPath(root, candidate string) bool {
-	relative, err := filepath.Rel(root, candidate)
-	if err != nil {
-		return true
-	}
-	return relative == "." || (!filepath.IsAbs(relative) && relative != ".." && !strings.HasPrefix(relative, ".."+string(filepath.Separator)))
-}
-
-func sqliteFilename(value string) (string, error) {
-	u, err := url.Parse(value)
-	if err != nil {
-		return "", err
-	}
-	path := u.Path
-	if strings.HasPrefix(path, "//") {
-		path = path[1:]
-	} else {
-		path = strings.TrimPrefix(path, "/")
-	}
-	if len(path) >= 3 && path[1] == ':' && path[2] == '/' {
-		path = path[1:]
-	}
-	if !filepath.IsAbs(filepath.FromSlash(path)) {
-		return "", errors.New("DATABASE_URL SQLite harus berupa jalur absolut")
-	}
-	return filepath.Clean(filepath.FromSlash(path)), nil
-}
-func createSQLiteBackup(databaseURL, backupDir, destination string) error {
-	databasePath, err := sqliteFilename(databaseURL)
-	if err != nil {
-		return err
-	}
-	sourceInfo, err := os.Stat(databasePath)
-	if err != nil || !sourceInfo.Mode().IsRegular() {
-		return errors.New("Database SQLite belum ada; backup tidak dibuat")
-	}
-	if resolved, e := filepath.EvalSymlinks(databasePath); e == nil {
-		databasePath = resolved
-	}
-	dbDir, err := filepath.Abs(filepath.Dir(databasePath))
-	if err != nil {
-		return err
-	}
-	if filepath.Clean(backupDir) == filepath.Clean(dbDir) || withinPath(backupDir, databasePath) {
-		return errors.New("BACKUP_DIR harus berada di luar folder database")
-	}
-	db, err := sql.Open("sqlite", databasePath)
-	if err != nil {
-		return errors.New("database SQLite tidak dapat dibuka")
 	}
 	defer db.Close()
-	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
-	defer cancel()
-	db.SetMaxOpenConns(1)
-	if err = db.PingContext(ctx); err != nil {
-		return errors.New("database SQLite tidak tersedia")
+	if value == "on" {
+		var active int
+		if err := db.QueryRow(ctx, `SELECT count(*) FROM signals WHERE status='CLAIMED' AND claimed_at >= $1`, time.Now().UTC().Add(-90*time.Second)).Scan(&active); err != nil {
+			return err
+		}
+		if active > 0 {
+			return errors.New("masih ada sinyal dalam proses; tunggu selesai sebelum update")
+		}
 	}
-	quoted := strings.ReplaceAll(destination, "'", "''")
-	if _, err = db.ExecContext(ctx, "VACUUM INTO '"+quoted+"'"); err != nil {
-		_ = os.Remove(destination)
-		return errors.New("backup SQLite tidak dapat dibuat")
+	state := "false"
+	if value == "on" {
+		state = "true"
 	}
-	copyDB, err := sql.Open("sqlite", destination)
-	if err != nil {
-		_ = os.Remove(destination)
-		return errors.New("backup SQLite tidak dapat diperiksa")
-	}
-	defer copyDB.Close()
-	var integrity string
-	if err = copyDB.QueryRowContext(ctx, "PRAGMA quick_check").Scan(&integrity); err != nil || integrity != "ok" {
-		_ = os.Remove(destination)
-		return errors.New("pemeriksaan integritas backup gagal")
-	}
-	return nil
+	_, err = db.Exec(ctx, `INSERT INTO settings(key,value) VALUES('kill_switch',$1) ON CONFLICT(key) DO UPDATE SET value=excluded.value`, state)
+	return err
 }
-
-func createPostgresBackup(databaseURL, destination string) error {
-	appEnv := strings.ToLower(strings.TrimSpace(os.Getenv("APP_ENV")))
-	backupURLValue := strings.TrimSpace(os.Getenv("BACKUP_DATABASE_URL"))
-	if appEnv == "production" && backupURLValue == "" {
-		return errors.New("BACKUP_DATABASE_URL wajib memakai role backup read-only di production")
+func run() error {
+	root := os.Getenv("PROJECT_ROOT")
+	if root == "" {
+		root, _ = os.Getwd()
 	}
-	if backupURLValue == "" {
-		backupURLValue = databaseURL
+	dbFile := resolveDatabaseFile()
+	token, chat := os.Getenv("TELEGRAM_BOT_TOKEN"), os.Getenv("TELEGRAM_ADMIN_CHAT_ID")
+	if token == "" || chat == "" {
+		return errors.New("backup Telegram membutuhkan TELEGRAM_BOT_TOKEN dan TELEGRAM_ADMIN_CHAT_ID")
 	}
-	backup, err := parsePostgresURL(backupURLValue)
-	if err != nil {
-		return fmt.Errorf("BACKUP_DATABASE_URL tidak valid: %w", err)
+	secret := os.Getenv("APP_SECRET_KEY")
+	if len(secret) < 32 {
+		return errors.New("APP_SECRET_KEY wajib tersedia untuk mengenkripsi backup")
 	}
-	runtime, err := parsePostgresURL(databaseURL)
-	if err != nil {
-		return fmt.Errorf("DATABASE_URL tidak valid: %w", err)
-	}
-	if backup.User.Username() == runtime.User.Username() {
-		return errors.New("BACKUP_DATABASE_URL harus memakai role read-only terpisah dari role runtime")
-	}
-	recipient := strings.TrimSpace(os.Getenv("BACKUP_AGE_RECIPIENT"))
-	if recipient == "" {
-		return errors.New("BACKUP_AGE_RECIPIENT wajib diisi agar pg_dump dienkripsi")
-	}
-	dumpFile, err := os.CreateTemp(filepath.Dir(destination), "algentra-postgres-*.dump")
-	if err != nil {
+	tmp := filepath.Join(root, "tmp")
+	if err := os.MkdirAll(tmp, 0700); err != nil {
 		return err
 	}
-	temporary := dumpFile.Name()
-	defer os.Remove(temporary)
-	if err = dumpFile.Close(); err != nil {
-		return err
-	}
-	port := backup.Port()
-	if port == "" {
-		port = "5432"
-	}
-	password, _ := backup.User.Password()
-	dbName := strings.TrimPrefix(backup.Path, "/")
-	env := filteredCommandEnvironment(os.Environ())
-	env = append(env, "PGHOST="+backup.Hostname(), "PGPORT="+port, "PGUSER="+backup.User.Username(), "PGPASSWORD="+password, "PGDATABASE="+dbName, "PGSSLMODE="+backup.Query().Get("sslmode"), "PGCONNECT_TIMEOUT=10")
+	stamp := time.Now().UTC().Format("20060102T150405Z")
+	snapshot := filepath.Join(tmp, "database-"+stamp+".sqlite")
+	archive := filepath.Join(tmp, "database-"+stamp+".zip")
+	encrypted := filepath.Join(tmp, "database-"+stamp+".zip.enc")
+	defer func() {
+		for _, p := range []string{snapshot, archive, encrypted} {
+			_ = os.Remove(p)
+		}
+	}()
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Minute)
 	defer cancel()
-	pgDump, err := exec.LookPath("pg_dump")
-	if err != nil {
-		return errors.New("executable backup tidak ditemukan: pg_dump")
+	if info, err := os.Stat(dbFile); err != nil || !info.Mode().IsRegular() {
+		return errors.New("file database belum ada; backup dibatalkan")
 	}
-	dump := exec.CommandContext(ctx, pgDump, "--no-owner", "--no-acl", "--format=custom", "--schema=app", "--file", temporary)
-	dump.Env = env
-	if _, err = dump.CombinedOutput(); err != nil {
-		return errors.New("Backup Supabase gagal (pg_dump); periksa koneksi dan izin backup")
-	}
-	age, err := exec.LookPath("age")
-	if err != nil {
-		return errors.New("executable backup tidak ditemukan: age")
-	}
-	encrypt := exec.CommandContext(ctx, age, "--encrypt", "--recipient", recipient, "--output", destination, temporary)
-	encrypt.Env = filteredCommandEnvironment(os.Environ())
-	if _, err = encrypt.CombinedOutput(); err != nil {
-		_ = os.Remove(destination)
-		return errors.New("Backup Supabase gagal (age encryption)")
-	}
-	info, err := os.Stat(destination)
-	if err != nil || info.Size() == 0 {
-		_ = os.Remove(destination)
-		return errors.New("File backup Supabase terenkripsi kosong")
-	}
-	return nil
-}
-
-func filteredCommandEnvironment(source []string) []string {
-	out := make([]string, 0, len(source))
-	for _, item := range source {
-		name, _, _ := strings.Cut(item, "=")
-		switch name {
-		case "PATH", "SYSTEMROOT", "WINDIR", "TEMP", "TMP":
-			out = append(out, item)
-		}
-	}
-	return out
-}
-
-func parsePostgresURL(value string) (*url.URL, error) {
-	u, err := url.Parse(value)
-	if err != nil {
-		return nil, errors.New("URL tidak valid")
-	}
-	if u.Scheme != "postgres" && u.Scheme != "postgresql" && u.Scheme != "postgresql+psycopg" {
-		return nil, errors.New("harus berupa connection string PostgreSQL")
-	}
-	if u.Hostname() == "" || u.User == nil || u.User.Username() == "" || u.Path == "" || u.Path == "/" {
-		return nil, errors.New("connection string PostgreSQL harus lengkap")
-	}
-	if _, ok := u.User.Password(); !ok {
-		return nil, errors.New("connection string PostgreSQL harus berisi kredensial")
-	}
-	ssl := strings.ToLower(u.Query().Get("sslmode"))
-	if ssl != "require" && ssl != "verify-ca" && ssl != "verify-full" {
-		return nil, errors.New("connection string PostgreSQL harus mewajibkan TLS")
-	}
-	return u, nil
-}
-
-func rotateBackups(directory string, pattern *regexp.Regexp) error {
-	entries, err := os.ReadDir(directory)
+	db, err := database.Open(ctx, dbFile)
 	if err != nil {
 		return err
 	}
-	names := []string{}
-	for _, entry := range entries {
-		if !entry.IsDir() && pattern.MatchString(entry.Name()) {
-			names = append(names, entry.Name())
+	defer db.Close()
+	escaped := strings.ReplaceAll(snapshot, "'", "''")
+	if _, err = db.Exec(ctx, "VACUUM INTO '"+escaped+"'"); err != nil {
+		return fmt.Errorf("snapshot SQLite: %w", err)
+	}
+	if err = zipSnapshot(snapshot, archive); err != nil {
+		return err
+	}
+	_, err = encryptFile(archive, encrypted, secret)
+	if err != nil {
+		return err
+	}
+	digest, hashErr := fileSHA256(encrypted)
+	if hashErr != nil {
+		return hashErr
+	}
+	info, err := os.Stat(encrypted)
+	if err != nil {
+		return err
+	}
+	caption := fmt.Sprintf("Algentra SQLite backup %s\nSize: %d bytes\nSHA-256: %s", filepath.Base(encrypted), info.Size(), digest)
+	if info.Size() > telegramLimit {
+		return sendMessage(ctx, token, chat, caption+"\nBackup melebihi batas unggah Telegram; file sementara dibersihkan.")
+	}
+	return sendDocument(ctx, token, chat, encrypted, caption)
+}
+
+func resolveDatabaseFile() string {
+	if value := strings.TrimSpace(os.Getenv("DATABASE_FILE")); value != "" {
+		return value
+	}
+	root := strings.TrimSpace(os.Getenv("PROJECT_ROOT"))
+	if root == "" {
+		root, _ = os.Getwd()
+	}
+	return filepath.Join(root, "data", "database.sqlite")
+}
+func fileSHA256(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err = io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
+
+func zipSnapshot(input, output string) error {
+	f, err := os.Create(output)
+	if err != nil {
+		return err
+	}
+	zw := zip.NewWriter(f)
+	src, err := os.Open(input)
+	if err != nil {
+		f.Close()
+		return err
+	}
+	entry, err := zw.Create(filepath.Base(input))
+	if err == nil {
+		_, err = io.Copy(entry, src)
+	}
+	src.Close()
+	zerr := zw.Close()
+	cerr := f.Close()
+	if err != nil {
+		return err
+	}
+	if zerr != nil {
+		return zerr
+	}
+	return cerr
+}
+func encryptFile(input, output, secret string) (string, error) {
+	key := sha256.Sum256([]byte(secret))
+	block, err := aes.NewCipher(key[:])
+	if err != nil {
+		return "", err
+	}
+	aead, err := cipher.NewGCM(block)
+	if err != nil {
+		return "", err
+	}
+	src, err := os.Open(input)
+	if err != nil {
+		return "", err
+	}
+	defer src.Close()
+	dst, err := os.OpenFile(output, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0600)
+	if err != nil {
+		return "", err
+	}
+	defer dst.Close()
+	prefix := make([]byte, 8)
+	if _, err = rand.Read(prefix); err != nil {
+		return "", err
+	}
+	if _, err = dst.Write(append([]byte("ALGENTRA1"), prefix...)); err != nil {
+		return "", err
+	}
+	hash := sha256.New()
+	buf := make([]byte, 1024*1024)
+	var counter uint32
+	for {
+		n, e := io.ReadFull(src, buf)
+		if e == io.EOF {
+			break
+		}
+		if e != nil && e != io.ErrUnexpectedEOF {
+			return "", e
+		}
+		nonce := make([]byte, 12)
+		copy(nonce, prefix)
+		nonce[8] = byte(counter >> 24)
+		nonce[9] = byte(counter >> 16)
+		nonce[10] = byte(counter >> 8)
+		nonce[11] = byte(counter)
+		counter++
+		ciphertext := aead.Seal(nil, nonce, buf[:n], nil)
+		size := uint32(len(ciphertext))
+		head := []byte{byte(size >> 24), byte(size >> 16), byte(size >> 8), byte(size)}
+		if _, err = dst.Write(head); err != nil {
+			return "", err
+		}
+		if _, err = dst.Write(ciphertext); err != nil {
+			return "", err
+		}
+		hash.Write(ciphertext)
+		if e == io.ErrUnexpectedEOF {
+			break
 		}
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(names)))
-	for _, name := range names[keepBackups:] {
-		if err = os.Remove(filepath.Join(directory, name)); err != nil {
-			return fmt.Errorf("backup lama tidak dapat dirotasi: %w", err)
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+func sendDocument(ctx context.Context, token, chat, path, caption string) error {
+	return telegramMultipart(ctx, token, "sendDocument", func(w *multipart.Writer) error {
+		if err := w.WriteField("chat_id", chat); err != nil {
+			return err
 		}
+		if err := w.WriteField("caption", caption); err != nil {
+			return err
+		}
+		part, err := w.CreateFormFile("document", filepath.Base(path))
+		if err != nil {
+			return err
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = io.Copy(part, f)
+		return err
+	})
+}
+func sendMessage(ctx context.Context, token, chat, message string) error {
+	return telegramMultipart(ctx, token, "sendMessage", func(w *multipart.Writer) error {
+		if err := w.WriteField("chat_id", chat); err != nil {
+			return err
+		}
+		return w.WriteField("text", message)
+	})
+}
+func telegramMultipart(ctx context.Context, token, method string, fill func(*multipart.Writer) error) error {
+	pr, pw := io.Pipe()
+	mw := multipart.NewWriter(pw)
+	go func() {
+		err := fill(mw)
+		if closeErr := mw.Close(); err == nil {
+			err = closeErr
+		}
+		_ = pw.CloseWithError(err)
+	}()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, "https://api.telegram.org/bot"+token+"/"+method, pr)
+	if err != nil {
+		return err
+	}
+	req.Header.Set("Content-Type", mw.FormDataContentType())
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 4096))
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("Telegram upload returned HTTP %d", resp.StatusCode)
 	}
 	return nil
 }

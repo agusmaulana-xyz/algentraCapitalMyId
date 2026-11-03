@@ -5,11 +5,167 @@ package main
 import (
 	"os"
 	"os/exec"
+	"strings"
 	"syscall"
 	"time"
+	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
+
+func manageMT5Charts(processID uint32, stopped <-chan struct{}, enforceSingle bool) {
+	// MT5 creates its chart window asynchronously after the process starts.
+	select {
+	case <-stopped:
+		return
+	case <-time.After(4 * time.Second):
+	}
+	maximizeMT5Charts(processID)
+	if !enforceSingle {
+		return
+	}
+	ticker := time.NewTicker(5 * time.Second)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-stopped:
+			return
+		case <-ticker.C:
+			enforceSingleMT5Chart(processID)
+		}
+	}
+}
+
+func maximizeMT5Charts(processID uint32) {
+	user32 := windows.NewLazySystemDLL("user32.dll")
+	showWindow := user32.NewProc("ShowWindowAsync")
+	getWindowRect := user32.NewProc("GetWindowRect")
+	getWindowTextLength := user32.NewProc("GetWindowTextLengthW")
+	getWindowText := user32.NewProc("GetWindowTextW")
+	maximize := uintptr(3) // SW_MAXIMIZE
+	var mainWindow windows.HWND
+	var largestArea int64
+	_ = windows.EnumWindows(syscall.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
+		var owner uint32
+		windows.GetWindowThreadProcessId(windows.HWND(hwnd), &owner)
+		if owner == processID && windows.IsWindowVisible(windows.HWND(hwnd)) {
+			var bounds struct{ Left, Top, Right, Bottom int32 }
+			if result, _, _ := getWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&bounds))); result != 0 {
+				area := int64(bounds.Right-bounds.Left) * int64(bounds.Bottom-bounds.Top)
+				if area > largestArea {
+					mainWindow = windows.HWND(hwnd)
+					largestArea = area
+				}
+			}
+		}
+		return 1
+	}), nil)
+	if mainWindow == 0 {
+		return
+	}
+	showWindow.Call(uintptr(mainWindow), maximize)
+	windows.EnumChildWindows(mainWindow, syscall.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
+		window := windows.HWND(hwnd)
+		if !windows.IsWindowVisible(window) {
+			return 1
+		}
+		length, _, _ := getWindowTextLength.Call(hwnd)
+		if length == 0 || length > 256 {
+			return 1
+		}
+		buffer := make([]uint16, length+1)
+		getWindowText.Call(hwnd, uintptr(unsafe.Pointer(&buffer[0])), uintptr(len(buffer)))
+		if isMT5ChartWindowTitle(windows.UTF16ToString(buffer)) {
+			showWindow.Call(hwnd, maximize)
+		}
+		return 1
+	}), nil)
+}
+
+// requestMT5Close asks the terminal's main window to close normally (WM_CLOSE)
+// so MT5 saves its state, including the Market Watch symbol list.
+func requestMT5Close(processID uint32) {
+	user32 := windows.NewLazySystemDLL("user32.dll")
+	getWindowRect := user32.NewProc("GetWindowRect")
+	postMessage := user32.NewProc("PostMessageW")
+	var mainWindow windows.HWND
+	var largestArea int64
+	_ = windows.EnumWindows(syscall.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
+		var owner uint32
+		windows.GetWindowThreadProcessId(windows.HWND(hwnd), &owner)
+		if owner == processID && windows.IsWindowVisible(windows.HWND(hwnd)) {
+			var bounds struct{ Left, Top, Right, Bottom int32 }
+			if result, _, _ := getWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&bounds))); result != 0 {
+				area := int64(bounds.Right-bounds.Left) * int64(bounds.Bottom-bounds.Top)
+				if area > largestArea {
+					mainWindow, largestArea = windows.HWND(hwnd), area
+				}
+			}
+		}
+		return 1
+	}), nil)
+	if mainWindow != 0 {
+		postMessage.Call(uintptr(mainWindow), 0x0010, 0, 0) // WM_CLOSE
+	}
+}
+
+func enforceSingleMT5Chart(processID uint32) {
+	user32 := windows.NewLazySystemDLL("user32.dll")
+	getWindowRect := user32.NewProc("GetWindowRect")
+	postMessage := user32.NewProc("PostMessageW")
+	var mainWindow windows.HWND
+	var largestArea int64
+	_ = windows.EnumWindows(syscall.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
+		var owner uint32
+		windows.GetWindowThreadProcessId(windows.HWND(hwnd), &owner)
+		if owner == processID && windows.IsWindowVisible(windows.HWND(hwnd)) {
+			var bounds struct{ Left, Top, Right, Bottom int32 }
+			if result, _, _ := getWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&bounds))); result != 0 {
+				area := int64(bounds.Right-bounds.Left) * int64(bounds.Bottom-bounds.Top)
+				if area > largestArea {
+					mainWindow = windows.HWND(hwnd)
+					largestArea = area
+				}
+			}
+		}
+		return 1
+	}), nil)
+	if mainWindow == 0 {
+		return
+	}
+	kept := false
+	windows.EnumChildWindows(mainWindow, syscall.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
+		if !windows.IsWindowVisible(windows.HWND(hwnd)) || !isMT5ChartWindowTitle(windowText(hwnd, user32)) {
+			return 1
+		}
+		if !kept {
+			kept = true
+			return 1
+		}
+		postMessage.Call(hwnd, 0x0010, 0, 0) // WM_CLOSE
+		return 1
+	}), nil)
+}
+
+func windowText(hwnd uintptr, user32 *windows.LazyDLL) string {
+	length, _, _ := user32.NewProc("GetWindowTextLengthW").Call(hwnd)
+	if length == 0 || length > 256 {
+		return ""
+	}
+	buffer := make([]uint16, length+1)
+	user32.NewProc("GetWindowTextW").Call(hwnd, uintptr(unsafe.Pointer(&buffer[0])), uintptr(len(buffer)))
+	return windows.UTF16ToString(buffer)
+}
+
+func isMT5ChartWindowTitle(title string) bool {
+	title = strings.ToUpper(strings.TrimSpace(title))
+	for _, period := range []string{",M1", ",M2", ",M3", ",M4", ",M5", ",M6", ",M10", ",M12", ",M15", ",M20", ",M30", ",H1", ",H2", ",H3", ",H4", ",H6", ",H8", ",H12", ",D1", ",W1", ",MN1"} {
+		if strings.HasSuffix(title, period) {
+			return true
+		}
+	}
+	return false
+}
 
 func prepareChild(cmd *exec.Cmd) {
 	cmd.SysProcAttr = &syscall.SysProcAttr{CreationFlags: 0x00000200} // CREATE_NEW_PROCESS_GROUP

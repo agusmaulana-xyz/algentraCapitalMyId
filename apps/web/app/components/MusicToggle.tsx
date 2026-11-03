@@ -10,7 +10,7 @@ const MUSIC_SRC = "/musik.mp3";
  * Autoplay /musik.mp3 (loop) kecuali preferensi tersimpan "algentra-music" === "off".
  * Klik: play/pause + simpan preferensi. Bila berkas 404, toggle disembunyikan.
  */
-export function MusicToggle() {
+export function MusicToggle({ alone = false }: { alone?: boolean }) {
   const audioRef = useRef<HTMLAudioElement>(null);
   const [available, setAvailable] = useState(true);
   const [playing, setPlaying] = useState(false);
@@ -91,7 +91,7 @@ export function MusicToggle() {
         <source src={MUSIC_SRC} type="audio/mpeg" />
       </audio>
       <button
-        className="music-toggle"
+        className={alone ? "music-toggle music-toggle--alone" : "music-toggle"}
         id="music-toggle"
         type="button"
         aria-pressed={playing}

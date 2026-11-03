@@ -11,6 +11,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	dbstore "github.com/rnpproject/algentra-backend/internal/database"
 	"io"
 	"mime/multipart"
 	"net/http"
@@ -22,13 +23,10 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
-
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type telegramPaymentBot struct {
-	pool          *pgxpool.Pool
+	pool          *dbstore.Pool
 	token, chatID string
 	pricing       ServicePricing
 	projectRoot   string
@@ -199,7 +197,7 @@ func (api paymentAPI) retryNotification(w http.ResponseWriter, r *http.Request) 
 	var notified sql.NullTime
 	err := api.pool.QueryRow(ctx, `SELECT status,admin_notified_at FROM payment_orders WHERE id=$1 AND owner_id=$2`, id, owner).Scan(&status, &notified)
 	cancel()
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, 404, "Pesanan tidak ditemukan")
 		return
 	}
@@ -339,9 +337,10 @@ func (bot *telegramPaymentBot) reviewOrder(parent context.Context, id int64, dec
 	var owner int64
 	var label, server, login, plan, mode, status string
 	var amount int64
+	var rentalDays int
 	var existing sql.NullInt64
-	err = tx.QueryRow(ctx, `SELECT owner_id,label,server,login,plan,execution_mode,total_idr,status,account_id FROM payment_orders WHERE id=$1 FOR UPDATE`, id).Scan(&owner, &label, &server, &login, &plan, &mode, &amount, &status, &existing)
-	if errors.Is(err, pgx.ErrNoRows) {
+	err = tx.QueryRow(ctx, `SELECT owner_id,label,server,login,plan,execution_mode,total_idr,status,account_id,rental_days FROM payment_orders WHERE id=$1 FOR UPDATE`, id).Scan(&owner, &label, &server, &login, &plan, &mode, &amount, &status, &existing, &rentalDays)
+	if errors.Is(err, sql.ErrNoRows) {
 		return "MISSING", 0, nil
 	}
 	if err != nil {
@@ -361,17 +360,35 @@ func (bot *telegramPaymentBot) reviewOrder(parent context.Context, id int64, dec
 		return "REJECTED", 0, nil
 	}
 	api := paymentAPI{pool: bot.pool, pricing: bot.pricing}
-	price, valid := api.resolvePlan(plan)
+	price, valid := api.resolvePlan(plan, rentalDays)
 	if !valid || price != amount {
 		return "INVALID_ORDER", 0, nil
 	}
 	managed := mode == "MANAGED"
 	var duplicate sql.NullInt64
-	err = tx.QueryRow(ctx, `SELECT id FROM mt5_accounts WHERE lower(server)=lower($1) AND login=$2 AND ($4::boolean OR owner_id=$3) ORDER BY id LIMIT 1`, server, login, owner, managed).Scan(&duplicate)
+	var duplicateOwner int64
+	var duplicateExpiry sql.NullTime
+	err = tx.QueryRow(ctx, `SELECT id,owner_id,rental_expires_at FROM mt5_accounts WHERE lower(server)=lower($1) AND login=$2 AND ($4::boolean OR owner_id=$3) ORDER BY id LIMIT 1`, server, login, owner, managed).Scan(&duplicate, &duplicateOwner, &duplicateExpiry)
 	if err == nil {
+		if plan == "RENTAL" && duplicateOwner == owner {
+			expiry := time.Now().UTC()
+			if duplicateExpiry.Valid && duplicateExpiry.Time.After(expiry) {
+				expiry = duplicateExpiry.Time
+			}
+			if _, err = tx.Exec(ctx, `UPDATE mt5_accounts SET rental_expires_at=$2,active=true WHERE id=$1`, duplicate.Int64, expiry.Add(time.Duration(rentalDays)*24*time.Hour).Format(time.RFC3339Nano)); err != nil {
+				return "", 0, err
+			}
+			if _, err = tx.Exec(ctx, `UPDATE payment_orders SET status='APPROVED',account_id=$2,updated_at=$3 WHERE id=$1`, id, duplicate.Int64, time.Now().UTC()); err != nil {
+				return "", 0, err
+			}
+			if err = tx.Commit(ctx); err != nil {
+				return "", 0, err
+			}
+			return "APPROVED", duplicate.Int64, nil
+		}
 		return "ACCOUNT_EXISTS", duplicate.Int64, nil
 	}
-	if !errors.Is(err, pgx.ErrNoRows) {
+	if !errors.Is(err, sql.ErrNoRows) {
 		return "", 0, err
 	}
 	random := make([]byte, 32)
@@ -381,8 +398,13 @@ func (bot *telegramPaymentBot) reviewOrder(parent context.Context, id int64, dec
 	token := base64.RawURLEncoding.EncodeToString(random)
 	sum := sha256.Sum256([]byte(token))
 	var accountID int64
-	err = tx.QueryRow(ctx, `INSERT INTO mt5_accounts(owner_id,label,server,login,plan,role,execution_mode,token_hash,active,created_at) SELECT owner_id,label,server,login,plan,'follower',execution_mode,$2,true,$3 FROM payment_orders WHERE id=$1 ON CONFLICT DO NOTHING RETURNING id`, id, hex.EncodeToString(sum[:]), time.Now().UTC()).Scan(&accountID)
-	if errors.Is(err, pgx.ErrNoRows) {
+	now := time.Now().UTC()
+	var rentalExpires any
+	if plan == "RENTAL" {
+		rentalExpires = now.Add(time.Duration(rentalDays) * 24 * time.Hour).Format(time.RFC3339Nano)
+	}
+	err = tx.QueryRow(ctx, `INSERT INTO mt5_accounts(owner_id,label,server,login,plan,role,execution_mode,token_hash,active,created_at,rental_expires_at,ea_mode) SELECT owner_id,label,server,login,plan,'follower',execution_mode,$2,true,$3,$4,'SERVER' FROM payment_orders WHERE id=$1 ON CONFLICT DO NOTHING RETURNING id`, id, hex.EncodeToString(sum[:]), now, rentalExpires).Scan(&accountID)
+	if errors.Is(err, sql.ErrNoRows) {
 		return "ACCOUNT_EXISTS", 0, nil
 	}
 	if err != nil {

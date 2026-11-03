@@ -8,17 +8,19 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"errors"
+	dbstore "github.com/rnpproject/algentra-backend/internal/database"
+	"io"
 	"net/http"
+	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rnpproject/algentra-backend/internal/ea/snapshot"
 )
 
 type clientMT5API struct {
-	pool             *pgxpool.Pool
+	pool             *dbstore.Pool
 	state            *snapshot.Store
 	pricing          ServicePricing
 	workerConfigured bool
@@ -35,6 +37,8 @@ func (api clientMT5API) register(mux *http.ServeMux) {
 		mux.HandleFunc("GET "+prefix+"/plans", api.listPlans)
 		mux.HandleFunc("GET "+prefix+"/pricing", api.servicePricing)
 		mux.HandleFunc("POST "+prefix+"/accounts", api.createAccount)
+		mux.HandleFunc("PUT "+prefix+"/accounts/{account_id}/ea-choice", api.setEAChoice)
+		mux.HandleFunc("POST "+prefix+"/accounts/{account_id}/custom-ea", api.uploadCustomEA)
 		mux.HandleFunc("POST "+prefix+"/accounts/{account_id}/rotate-token", api.rotateToken)
 		mux.HandleFunc("PUT "+prefix+"/accounts/{account_id}/active", api.setAccountActive)
 		mux.HandleFunc("PUT "+prefix+"/accounts/{account_id}", api.updateAccount)
@@ -52,6 +56,7 @@ func (api clientMT5API) listPlans(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	plans := map[string]map[string]any{
+		"RENTAL":  {"name": "Sewa server", "vcpu": "MT5 server", "ram": "—", "disk": "—", "price_idr": 2000},
 		"ZERO":    {"name": "ZERO", "vcpu": "1 core", "ram": "1 GB", "disk": "20 GB", "price_idr": 150000},
 		"PRO":     {"name": "PRO", "vcpu": "2 core", "ram": "4 GB", "disk": "40 GB", "price_idr": 200000},
 		"EXPERT":  {"name": "EXPERT", "vcpu": "4 core", "ram": "8 GB", "disk": "80 GB", "price_idr": 300000},
@@ -76,6 +81,7 @@ func (api clientMT5API) servicePricing(w http.ResponseWriter, r *http.Request) {
 		vps = append(vps, map[string]any{"code": item.Code, "name": item.Name, "vcpu": item.VCPU, "ram": item.RAM, "disk": item.Disk, "price_idr": item.PriceIDR})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
+		"daily_rate_idr": 2000, "minimum_rental_days": 10,
 		"management_fee_idr":   api.pricing.ManagementFeeIDR,
 		"copy_trading_fee_idr": api.pricing.ManagementFeeIDR / 2,
 		"vps_options":          vps,
@@ -116,7 +122,7 @@ func (api clientMT5API) deleteAccount(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback(ctx)
 	var mode string
 	err = tx.QueryRow(ctx, `SELECT execution_mode FROM mt5_accounts WHERE id = $1 AND owner_id = $2 FOR UPDATE`, accountID, ownerID).Scan(&mode)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "Akun MT5 tidak ditemukan")
 		return
 	}
@@ -127,7 +133,7 @@ func (api clientMT5API) deleteAccount(w http.ResponseWriter, r *http.Request) {
 	if mode == "MANAGED" {
 		var active bool
 		err = tx.QueryRow(ctx, `SELECT active FROM managed_copy_profiles WHERE account_id = $1`, accountID).Scan(&active)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusServiceUnavailable, "Status managed copy tidak tersedia")
 			return
 		}
@@ -169,7 +175,7 @@ func (api clientMT5API) rotateToken(w http.ResponseWriter, r *http.Request) {
 	}
 	var mode string
 	err = api.pool.QueryRow(ctx, `SELECT execution_mode FROM mt5_accounts WHERE id = $1 AND owner_id = $2`, accountID, ownerID).Scan(&mode)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "Akun MT5 tidak ditemukan")
 		return
 	}
@@ -212,6 +218,7 @@ func (api clientMT5API) listAccounts(w http.ResponseWriter, r *http.Request) {
 	masterOnline := hasSnapshot && latest.Account != nil && now.Sub(latest.ObservedAt) <= 20*time.Second && now.Sub(latest.Account.ObservedAt) <= 30*time.Second
 	rows, err := api.pool.Query(ctx, `
 		SELECT a.id, a.label, a.server, a.login, a.plan, a.execution_mode, a.active, a.last_seen_at, a.created_at,
+		       a.rental_expires_at, a.ea_mode, a.custom_ea_name,
 		       s.balance, s.equity, s.floating_profit, s.currency, s.trade_mode, s.observed_at,
 		       s.terminal_trade_allowed, s.expert_trade_allowed,
 	       p.account_id, p.login_status, p.login_message, p.follower_symbol, p.active, p.status,
@@ -234,6 +241,8 @@ func (api clientMT5API) listAccounts(w http.ResponseWriter, r *http.Request) {
 		var label, server, login, plan, mode string
 		var active bool
 		var lastSeen, createdAt, stateObserved sql.NullTime
+		var rentalExpires sql.NullTime
+		var eaMode, customEAName sql.NullString
 		var balance, equity, floating sql.NullFloat64
 		var currency, tradeMode sql.NullString
 		var terminalAllowed, expertAllowed sql.NullBool
@@ -244,12 +253,15 @@ func (api clientMT5API) listAccounts(w http.ResponseWriter, r *http.Request) {
 		var lotMode sql.NullString
 		var ratio, fixedLot, maxOrder, maxTotal sql.NullFloat64
 		var maxPositions sql.NullInt64
-		if err := rows.Scan(&id, &label, &server, &login, &plan, &mode, &active, &lastSeen, &createdAt,
+		if err := rows.Scan(&id, &label, &server, &login, &plan, &mode, &active, &lastSeen, &createdAt, &rentalExpires, &eaMode, &customEAName,
 			&balance, &equity, &floating, &currency, &tradeMode, &stateObserved, &terminalAllowed, &expertAllowed,
 			&profileID, &loginStatus, &loginMessage, &followerSymbol, &profileActive, &profileStatus,
 			&statusMessage, &profileSeen, &profileUpdated, &lotMode, &ratio, &fixedLot, &maxOrder, &maxTotal, &maxPositions); err != nil {
 			writeError(w, http.StatusServiceUnavailable, "Daftar akun MT5 tidak dapat dibaca")
 			return
+		}
+		if rentalExpires.Valid && !rentalExpires.Time.After(now) {
+			active = false
 		}
 		followerOnline := active && lastSeen.Valid && now.Sub(lastSeen.Time) <= 30*time.Second
 		stateOnline := stateObserved.Valid && now.Sub(stateObserved.Time) <= 30*time.Second
@@ -268,6 +280,7 @@ func (api clientMT5API) listAccounts(w http.ResponseWriter, r *http.Request) {
 			"id": id, "label": label, "server": server, "login": login, "plan": plan,
 			"execution_mode": mode, "role": "follower", "active": active,
 			"last_seen_at": nullableWIB(lastSeen, wib), "connection_status": connection,
+			"rental_expires_at": nullableWIB(rentalExpires, wib), "ea_mode": nullableString(eaMode), "custom_ea_name": nullableString(customEAName),
 			"balance": nullableFloat(balance), "equity": nullableFloat(equity), "floating_profit": nullableFloat(floating),
 			"currency": nullableString(currency), "trade_mode": nullableString(tradeMode),
 			"state_updated_at": nullableWIB(stateObserved, wib), "created_at": nullableWIB(createdAt, wib),
@@ -310,7 +323,86 @@ func (api clientMT5API) createAccount(w http.ResponseWriter, r *http.Request) {
 	writeError(w, http.StatusConflict, "Akun dibuat setelah admin menyetujui pembayaran. Buat pesanan melalui alur pembayaran.")
 }
 
-func requireClient(ctx context.Context, pool *pgxpool.Pool, w http.ResponseWriter, r *http.Request) (int64, bool) {
+func (api clientMT5API) setEAChoice(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 10*time.Second)
+	defer cancel()
+	ownerID, ok := requireClient(ctx, api.pool, w, r)
+	if !ok {
+		return
+	}
+	accountID, err := strconv.ParseInt(r.PathValue("account_id"), 10, 64)
+	if err != nil || accountID <= 0 {
+		writeError(w, http.StatusNotFound, "Akun MT5 tidak ditemukan")
+		return
+	}
+	var payload struct {
+		Mode string `json:"mode"`
+	}
+	if err = decodeJSON(w, r, &payload, 8<<10); err != nil || payload.Mode != "SERVER" {
+		writeError(w, http.StatusUnprocessableEntity, "Pilih EA yang disediakan server atau unggah EA sendiri.")
+		return
+	}
+	result, err := api.pool.Exec(ctx, `UPDATE mt5_accounts SET ea_mode='SERVER',custom_ea_name=NULL,custom_ea_data=NULL,custom_ea_updated_at=NULL WHERE id=$1 AND owner_id=$2`, accountID, ownerID)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "Pilihan EA tidak dapat disimpan")
+		return
+	}
+	if result.RowsAffected() == 0 {
+		writeError(w, http.StatusNotFound, "Akun MT5 tidak ditemukan")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "saved", "ea_mode": "SERVER"})
+}
+
+const maxUploadedEABytes = 10 << 20
+
+func (api clientMT5API) uploadCustomEA(w http.ResponseWriter, r *http.Request) {
+	ctx, cancel := context.WithTimeout(r.Context(), 20*time.Second)
+	defer cancel()
+	ownerID, ok := requireClient(ctx, api.pool, w, r)
+	if !ok {
+		return
+	}
+	accountID, err := strconv.ParseInt(r.PathValue("account_id"), 10, 64)
+	if err != nil || accountID <= 0 {
+		writeError(w, http.StatusNotFound, "Akun MT5 tidak ditemukan")
+		return
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, maxUploadedEABytes+(1<<20))
+	if err := r.ParseMultipartForm(maxUploadedEABytes); err != nil {
+		writeError(w, http.StatusBadRequest, "File EA tidak valid atau melebihi batas 10 MB")
+		return
+	}
+	file, header, err := r.FormFile("ea")
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "Pilih file EA .mq5 atau .ex5")
+		return
+	}
+	defer file.Close()
+	name := filepath.Base(strings.ReplaceAll(header.Filename, `\`, "/"))
+	ext := strings.ToLower(filepath.Ext(name))
+	if len(name) < 5 || (ext != ".ex5" && ext != ".mq5") || strings.ContainsAny(name, "\r\n") {
+		writeError(w, http.StatusUnprocessableEntity, "Format EA harus berupa .mq5 atau .ex5")
+		return
+	}
+	data, err := io.ReadAll(io.LimitReader(file, maxUploadedEABytes+1))
+	if err != nil || len(data) == 0 || len(data) > maxUploadedEABytes {
+		writeError(w, http.StatusBadRequest, "File EA kosong, tidak dapat dibaca, atau melebihi batas 10 MB")
+		return
+	}
+	result, err := api.pool.Exec(ctx, `UPDATE mt5_accounts SET ea_mode='CUSTOM',custom_ea_name=$3,custom_ea_data=$4,custom_ea_updated_at=$5 WHERE id=$1 AND owner_id=$2`, accountID, ownerID, name, data, time.Now().UTC().Format(time.RFC3339Nano))
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "File EA tidak dapat disimpan")
+		return
+	}
+	if result.RowsAffected() == 0 {
+		writeError(w, http.StatusNotFound, "Akun MT5 tidak ditemukan")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": "uploaded", "ea_mode": "CUSTOM", "custom_ea_name": name})
+}
+
+func requireClient(ctx context.Context, pool *dbstore.Pool, w http.ResponseWriter, r *http.Request) (int64, bool) {
 	ownerID, ok := ClientIDFromRequest(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "Login pengguna diperlukan")

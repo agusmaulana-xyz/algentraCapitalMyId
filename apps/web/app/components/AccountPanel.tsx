@@ -1,7 +1,7 @@
 "use client";
 
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
-import { apiRequest } from "../lib/api";
+import { apiRequest, apiUpload } from "../lib/api";
 import {
   formatInteger,
   formatMoney,
@@ -9,7 +9,6 @@ import {
   toneClass,
   type Tone,
 } from "../lib/format";
-import { CsChatWidget } from "./CsChatWidget";
 import { AccountPerformanceDetails } from "./AccountPerformanceDetails";
 
 type Plan = {
@@ -21,6 +20,8 @@ type Plan = {
 };
 
 type Pricing = {
+  daily_rate_idr: number;
+  minimum_rental_days: number;
   management_fee_idr: number;
   copy_trading_fee_idr: number;
   vps_options: VpsOption[];
@@ -59,6 +60,9 @@ type Account = {
   login: string;
   plan: string;
   execution_mode: string;
+  rental_expires_at?: string | null;
+  ea_mode?: string | null;
+  custom_ea_name?: string | null;
   active: boolean;
   last_seen_at?: string | null;
   connection_status: string;
@@ -107,6 +111,29 @@ type CopierStatus = {
 
 type TokenBox = { title: string; token: string; accountId: number } | null;
 type BrokerServerOption = { name: string; company: string };
+const brokerSearchFallback = "Pencarian server sedang tidak tersedia. Gunakan Input Manual dan masukkan nama server persis dari broker.";
+
+async function searchBrokerServers(query: string, signal: AbortSignal): Promise<BrokerServerOption[]> {
+  let response: Response;
+  try {
+    response = await fetch(`/api/mt5/servers?q=${encodeURIComponent(query)}`, { signal, headers: { Accept: "application/json" } });
+  } catch (error) {
+    if (signal.aborted) throw error;
+    throw new Error(brokerSearchFallback);
+  }
+  if (!/json/i.test(response.headers.get("content-type") || "")) throw new Error(brokerSearchFallback);
+  let payload: { servers?: BrokerServerOption[]; detail?: string; error?: string };
+  try {
+    payload = await response.json();
+  } catch {
+    throw new Error(brokerSearchFallback);
+  }
+  if (!response.ok) {
+    const detail = payload.detail || payload.error;
+    throw new Error(detail ? `${detail} Gunakan Input Manual jika nama server sudah diketahui.` : brokerSearchFallback);
+  }
+  return Array.isArray(payload.servers) ? payload.servers : [];
+}
 
 type MetricItem = [string, number | null | undefined, (string | null | undefined)?, Tone?];
 
@@ -315,6 +342,21 @@ function ManagedAccountCard({
   onMessage: (message: string) => void;
   onReload: () => void;
 }) {
+  const [customEAFile, setCustomEAFile] = useState<File | null>(null);
+  const [eaBusy, setEABusy] = useState(false);
+  const [eaMessage, setEAMessage] = useState("");
+  const [liveConfirmOpen, setLiveConfirmOpen] = useState(false);
+  const [copyToggleBusy, setCopyToggleBusy] = useState(false);
+  const liveConfirmDialogRef = useRef<HTMLDialogElement>(null);
+  const [editingIdentity, setEditingIdentity] = useState(false);
+  const [identityBusy, setIdentityBusy] = useState(false);
+  const [identityServerQuery, setIdentityServerQuery] = useState(account.server);
+  const [identityServerOptions, setIdentityServerOptions] = useState<BrokerServerOption[]>([]);
+  const [identitySelectedServer, setIdentitySelectedServer] = useState(account.server);
+  const [identityManualServer, setIdentityManualServer] = useState(false);
+  const [identityServerText, setIdentityServerText] = useState(account.server);
+  const [identityServerSearchMessage, setIdentityServerSearchMessage] = useState("");
+  const [identityServerSearchBusy, setIdentityServerSearchBusy] = useState(false);
   const profile: ManagedCopy = account.managed_copy ?? {
     configured: false,
     active: false,
@@ -327,14 +369,48 @@ function ManagedAccountCard({
     profile.last_seen_at ? wib(profile.last_seen_at) : "belum terhubung"
   }`;
 
+  useEffect(() => {
+    const query = identityServerQuery.trim();
+    if (!editingIdentity || query.length < 3) {
+      setIdentityServerOptions([]);
+      setIdentityServerSearchBusy(false);
+      return;
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(async () => {
+      setIdentityServerSearchBusy(true);
+      setIdentityServerSearchMessage("");
+      try {
+        const results = await searchBrokerServers(query, controller.signal);
+        const options = results.some((option) => option.name.toLowerCase() === account.server.toLowerCase())
+          ? results
+          : [{ name: account.server, company: "Server saat ini" }, ...results];
+        setIdentityServerOptions(options);
+        setIdentityServerSearchMessage(results.length ? `${results.length} server ditemukan.` : "Server tidak ditemukan. Gunakan nama persis dari broker atau coba kata kunci lain.");
+      } catch (error) {
+        if (controller.signal.aborted) return;
+        setIdentityServerOptions([{ name: account.server, company: "Server saat ini" }]);
+        setIdentityServerSearchMessage(error instanceof Error ? error.message : "Pencarian server gagal.");
+      } finally {
+        if (!controller.signal.aborted) setIdentityServerSearchBusy(false);
+      }
+    }, 350);
+    return () => { clearTimeout(timer); controller.abort(); };
+  }, [account.server, editingIdentity, identityServerQuery]);
+
+  useEffect(() => {
+    const dialog = liveConfirmDialogRef.current;
+    if (liveConfirmOpen && dialog && !dialog.open) dialog.showModal();
+    else if (!liveConfirmOpen && dialog?.open) dialog.close();
+  }, [liveConfirmOpen]);
+
   const loginMessages: Record<string, string> = {
-    UNCHECKED:
-      "Login broker belum diperiksa. Simpan kredensial untuk memulai pemeriksaan otomatis.",
-    CHECKING: "Sedang memeriksa login broker dan kesiapan terminal MT5…",
-    VALID: profile.login_message || "Login broker berhasil dan terminal siap.",
+    UNCHECKED: "Login belum diperiksa. Simpan kredensial untuk memeriksa.",
+    CHECKING: "Memeriksa login broker…",
+    VALID: profile.login_message || "Login broker berhasil.",
     ERROR:
       profile.login_message ||
-      "Pemeriksaan login belum berhasil. Silakan periksa kembali data akun atau coba lagi nanti.",
+      "Login belum berhasil. Periksa data akun.",
   };
   const loginMessage =
     (profile.login_status && loginMessages[profile.login_status]) ||
@@ -347,18 +423,49 @@ function ManagedAccountCard({
         : " account-login-check--pending"
   }`;
 
+  const handleIdentityUpdate = async (event: React.FormEvent<HTMLFormElement>) => {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    const nextServer = String(form.get("server") || "").trim();
+    if (!nextServer) {
+      onMessage("Pilih server dari hasil pencarian MT5 atau masukkan nama server yang diberikan broker.");
+      return;
+    }
+    const nextLogin = String(form.get("account_login") || "").trim();
+    const identityChanged = nextServer.toLowerCase() !== account.server.toLowerCase() || nextLogin !== account.login;
+    setIdentityBusy(true);
+    onMessage("");
+    try {
+      await apiRequest(`mt5/accounts/${account.id}`, {
+        method: "PUT",
+        body: JSON.stringify({
+          label: form.get("account_label"),
+          server: nextServer,
+          login: nextLogin,
+        }),
+      });
+      setEditingIdentity(false);
+      onMessage(identityChanged
+        ? "Akun diperbarui. Masukkan password trading akun ini, lalu simpan pengaturan agar login diperiksa ulang."
+        : "Nama akun berhasil diperbarui.");
+      onReload();
+    } catch (error) {
+      onMessage(error instanceof Error ? error.message : "Detail akun tidak dapat diperbarui.");
+    } finally {
+      setIdentityBusy(false);
+    }
+  };
+
   const stateLabels: Record<string, string> = {
-    SETUP_REQUIRED: "Masukkan password broker dan atur batas copy terlebih dahulu.",
-    PAUSED: "Copy trading dijeda. Tidak ada order baru yang dikirim.",
-    STARTING: "Permintaan diterima. Menunggu worker copier mengambil job.",
-    RUNNING:
-      "Worker copier tersambung. Periksa terminal dan akun broker secara berkala.",
-    OFFLINE:
-      "Worker copier tidak mengirim heartbeat terbaru. Akun tidak sedang disinkronkan.",
+    SETUP_REQUIRED: "Isi password broker dan batas copy.",
+    PAUSED: "Copy dijeda.",
+    STARTING: "Menunggu worker mengambil job…",
+    RUNNING: "Worker tersambung.",
+    OFFLINE: "Worker belum mengirim heartbeat.",
     ERROR:
       profile.status_message ||
-      "Worker copier melaporkan kendala. Periksa server dan akun broker.",
-    STOPPED: "Worker copier berhenti. Periksa konfigurasi server.",
+      "Worker melaporkan kendala.",
+    STOPPED: "Worker berhenti.",
   };
   const connectionModifier =
     profile.status === "RUNNING"
@@ -399,24 +506,67 @@ function ManagedAccountCard({
     }
   };
 
-  const handleToggleCopy = async () => {
-    const active = !profile.active;
-    if (
-      active &&
-      !confirm(
-        "Konfirmasi: job ini akan mengirim order live ke akun broker Anda. Pastikan akun demo sudah diuji, login/server benar, serta batas lot dan posisi sesuai. Lanjutkan?"
-      )
-    )
+  const handleServerEA = async () => {
+    setEABusy(true);
+    setEAMessage("");
+    try {
+      await apiRequest(`mt5/accounts/${account.id}/ea-choice`, {
+        method: "PUT",
+        body: JSON.stringify({ mode: "SERVER" }),
+      });
+      setEAMessage("EA server akan dijalankan pada terminal sewa.");
+      onReload();
+    } catch (error) {
+      setEAMessage(error instanceof Error ? error.message : "Pilihan EA gagal disimpan.");
+    } finally {
+      setEABusy(false);
+    }
+  };
+
+  const handleCustomEAUpload = async () => {
+    if (!customEAFile) {
+      setEAMessage("Pilih file EA .mq5 atau .ex5 terlebih dahulu.");
       return;
+    }
+    setEABusy(true);
+    setEAMessage("");
+    try {
+      const form = new FormData();
+      form.set("ea", customEAFile);
+      await apiUpload(`mt5/accounts/${account.id}/custom-ea`, form);
+      setEAMessage("EA diunggah. Worker akan memasang dan menjalankannya pada terminal sewa.");
+      setCustomEAFile(null);
+      onReload();
+    } catch (error) {
+      setEAMessage(error instanceof Error ? error.message : "Upload EA gagal.");
+    } finally {
+      setEABusy(false);
+    }
+  };
+
+  const setCopyActive = async (active: boolean) => {
+    setCopyToggleBusy(true);
+    onMessage("");
     try {
       await apiRequest(`mt5/accounts/${account.id}/managed-copy/active`, {
         method: "PUT",
         body: JSON.stringify({ active, acknowledge_live_risk: active }),
       });
+      setLiveConfirmOpen(false);
       onReload();
     } catch (error) {
       onMessage(error instanceof Error ? error.message : "Permintaan tidak berhasil.");
+    } finally {
+      setCopyToggleBusy(false);
     }
+  };
+
+  const handleToggleCopy = () => {
+    if (!profile.active) {
+      setLiveConfirmOpen(true);
+      return;
+    }
+    void setCopyActive(false);
   };
 
   const handleRemove = async () => {
@@ -444,6 +594,75 @@ function ManagedAccountCard({
       <h3>{account.label}</h3>
       <p>{detail}</p>
       <p className="muted">{stateText}</p>
+      {account.rental_expires_at ? <p className="muted">Sewa aktif sampai {wib(account.rental_expires_at)}</p> : null}
+      <details className="account-identity-editor">
+        <summary>Ganti akun login MT5</summary>
+        <p className="field-help">Jeda copy sebelum mengganti akun.</p>
+        {editingIdentity ? (
+          <form className="form-grid" onSubmit={handleIdentityUpdate}>
+            <label>Nama akun<input name="account_label" maxLength={80} defaultValue={account.label} required /></label>
+            <div className="broker-server-field">
+              <label htmlFor={`identity-server-query-${account.id}`}>Cari broker atau server MT5</label>
+              <input
+                id={`identity-server-query-${account.id}`}
+                type="search"
+                value={identityServerQuery}
+                maxLength={96}
+                autoComplete="off"
+                placeholder="Contoh: HFM atau HFMarketsGlobal-Live11"
+                onChange={(event) => {
+                  setIdentityServerQuery(event.currentTarget.value);
+                  setIdentitySelectedServer("");
+                }}
+              />
+              {identityManualServer ? (
+                <>
+                  <label htmlFor={`identity-server-manual-${account.id}`}>Nama server persis dari broker</label>
+                  <input id={`identity-server-manual-${account.id}`} name="server" value={identityServerText} maxLength={128} required onChange={(event) => setIdentityServerText(event.currentTarget.value)} />
+                </>
+              ) : (
+                <>
+                  <label htmlFor={`identity-server-select-${account.id}`}>Server akun MT5</label>
+                  <select id={`identity-server-select-${account.id}`} name="server" value={identitySelectedServer} required onChange={(event) => setIdentitySelectedServer(event.currentTarget.value)}>
+                    <option value="">Pilih server dari daftar MT5</option>
+                    {identityServerOptions.map((option) => <option key={`${option.company}:${option.name}`} value={option.name}>{option.name} — {option.company}</option>)}
+                  </select>
+                </>
+              )}
+              <span className="field-help" role="status">{identityServerSearchBusy ? "Mencari direktori server MT5…" : identityServerSearchMessage || "Ketik minimal 3 karakter nama broker atau server."}</span>
+              <button type="button" className="secondary server-manual-toggle" onClick={() => { setIdentityManualServer((manual) => !manual); setIdentityServerText(account.server); setIdentitySelectedServer(""); }}>
+                {identityManualServer ? "Pilih dari Daftar Server" : "Input Manual"}
+              </button>
+            </div>
+            <label>Nomor login MT5<input name="account_login" inputMode="numeric" maxLength={32} pattern="[0-9]+" defaultValue={account.login} required /></label>
+            <div className="toolbar">
+              <button type="submit" disabled={identityBusy || profile.active}>{identityBusy ? "Menyimpan…" : "Simpan akun"}</button>
+              <button type="button" className="secondary" onClick={() => setEditingIdentity(false)}>Batal</button>
+            </div>
+          </form>
+        ) : (
+          <button type="button" className="secondary" disabled={profile.active} onClick={() => { setIdentityServerQuery(account.server); setIdentitySelectedServer(account.server); setIdentityServerText(account.server); setEditingIdentity(true); }}>
+            {profile.active ? "Jeda copy sebelum mengganti akun" : "Ubah server atau nomor login"}
+          </button>
+        )}
+      </details>
+      <section className="account-ea-choice" aria-label="Pilihan Expert Advisor server">
+        <h4>EA server</h4>
+        <div className="toolbar">
+          <button type="button" className={account.ea_mode === "CUSTOM" ? "secondary" : ""} disabled={eaBusy} onClick={() => void handleServerEA()}>
+            Pakai EA server
+          </button>
+          <span>{account.ea_mode === "CUSTOM" ? `EA sendiri: ${account.custom_ea_name || "terpasang"}` : "EA server dipilih"}</span>
+        </div>
+        <label>
+          EA sendiri (.mq5 / .ex5, maks 10 MB)
+          <input type="file" accept=".mq5,.ex5,application/octet-stream,text/plain" onChange={(event) => setCustomEAFile(event.currentTarget.files?.[0] || null)} />
+        </label>
+        <button type="button" className="secondary" disabled={eaBusy || !customEAFile} onClick={() => void handleCustomEAUpload()}>
+          {eaBusy ? "Memproses…" : "Unggah EA sendiri"}
+        </button>
+        {eaMessage ? <p className="status" role="status">{eaMessage}</p> : null}
+      </section>
       <p className={loginClass} role="status" aria-live="polite">
         {loginMessage}
       </p>
@@ -469,19 +688,20 @@ function ManagedAccountCard({
             required
             placeholder={
               profile.configured
-                ? "Isi ulang untuk mengganti"
-                : "Password trading akun follower"
+                ? "Isi untuk mengganti"
+                : "Password trading"
             }
           />
         </label>
         <label>
-          Nama simbol XAUUSD di broker
+          Simbol XAUUSD (opsional)
           <input
             name="follower_symbol"
             type="text"
             maxLength={64}
             pattern="[A-Za-z0-9._-]+"
-            defaultValue={profile.follower_symbol || "XAUUSD"}
+            placeholder="Otomatis"
+            defaultValue={profile.follower_symbol && profile.follower_symbol.toUpperCase() !== "XAUUSD" ? profile.follower_symbol : ""}
           />
         </label>
         <label>
@@ -492,7 +712,7 @@ function ManagedAccountCard({
           </select>
         </label>
         <label>
-          Pengali lot rasio
+          Pengali rasio
           <input
             name="ratio_lot"
             type="number"
@@ -559,19 +779,62 @@ function ManagedAccountCard({
           </button>
         </div>
       </form>
-      <div className="toolbar">
+      {account.ea_mode !== "CUSTOM" ? <div className="toolbar">
         <button
           type="button"
           className={profile.active ? "secondary" : ""}
-          disabled={toggleDisabled}
+          disabled={toggleDisabled || copyToggleBusy}
           onClick={handleToggleCopy}
         >
-          {profile.active ? "Jeda copy trading" : "Mulai copy trading (live)"}
+          {copyToggleBusy ? "Menyimpan…" : profile.active ? "Jeda copy trading" : "Mulai copy trading (live)"}
         </button>
         <button type="button" className="danger" onClick={handleRemove}>
           Hapus akun
         </button>
-      </div>
+      </div> : <div className="toolbar">
+        <span className="muted">Memakai EA sendiri.</span>
+        <button type="button" className="danger" onClick={handleRemove}>Hapus akun</button>
+      </div>}
+      <dialog
+        ref={liveConfirmDialogRef}
+        className="live-copy-confirm-dialog"
+        aria-labelledby={`live-copy-confirm-title-${account.id}`}
+        aria-describedby={`live-copy-confirm-description-${account.id}`}
+        onCancel={(event) => {
+          event.preventDefault();
+          if (!copyToggleBusy) setLiveConfirmOpen(false);
+        }}
+        onClick={(event) => {
+          if (event.target === event.currentTarget && !copyToggleBusy) setLiveConfirmOpen(false);
+        }}
+      >
+        <div className="live-copy-confirm-dialog__icon" aria-hidden="true">!</div>
+        <h2 id={`live-copy-confirm-title-${account.id}`}>Konfirmasi copy trading live</h2>
+        <p id={`live-copy-confirm-description-${account.id}`}>
+          Copy trading akan mengirim order live ke akun broker <strong>{account.label}</strong> ({account.login}).
+          Pastikan akun demo sudah diuji, login dan server benar, serta batas lot dan posisi sudah sesuai.
+          Apakah Anda yakin ingin melanjutkan?
+        </p>
+        <div className="live-copy-confirm-dialog__actions">
+          <button
+            type="button"
+            className="secondary"
+            autoFocus
+            disabled={copyToggleBusy}
+            onClick={() => setLiveConfirmOpen(false)}
+          >
+            Batal
+          </button>
+          <button
+            type="button"
+            className="live-copy-confirm-dialog__submit"
+            disabled={copyToggleBusy}
+            onClick={() => void setCopyActive(true)}
+          >
+            {copyToggleBusy ? "Mengaktifkan…" : "Ya, lanjutkan"}
+          </button>
+        </div>
+      </dialog>
     </article>
   );
 }
@@ -594,10 +857,9 @@ export function AccountPanel() {
   const [serverSearchMessage, setServerSearchMessage] = useState("");
   const [showAccountForm, setShowAccountForm] = useState(false);
   const [rootUrl, setRootUrl] = useState("");
+  const [rentalDays, setRentalDays] = useState(10);
 
-  const selectedVpsPrice =
-    pricing?.vps_options.find((v) => v.code === selectedVps)?.price_idr ?? 0;
-  const totalIdr = (pricing?.copy_trading_fee_idr ?? 0) + selectedVpsPrice;
+  const totalIdr = rentalDays * 2000;
   const [tokenBox, setTokenBox] = useState<TokenBox>(null);
   const [tokenCopied, setTokenCopied] = useState(false);
   const managedFormDirty = useRef(false);
@@ -646,7 +908,7 @@ export function AccountPanel() {
     apiRequest<Pricing>("mt5/pricing")
       .then(setPricing)
       .catch(() => {});
-    const stream = new EventSource("/api/core/mt5/stream");
+    const stream = new EventSource("/api/mt5/stream");
     const applySnapshot = (event: MessageEvent<string>) => {
       try {
         const payload = JSON.parse(event.data) as { accounts?: Account[]; performance?: Performance; copier?: CopierStatus };
@@ -691,16 +953,7 @@ export function AccountPanel() {
       setServerSearchBusy(true);
       setServerSearchMessage("");
       try {
-        const response = await fetch(
-          `/api/mt5/servers?q=${encodeURIComponent(query)}`,
-          { signal: controller.signal }
-        );
-        const payload = (await response.json()) as {
-          servers?: BrokerServerOption[];
-          error?: string;
-        };
-        if (!response.ok) throw new Error(payload.error || "Pencarian server gagal.");
-        const options = Array.isArray(payload.servers) ? payload.servers : [];
+        const options = await searchBrokerServers(query, controller.signal);
         setServerOptions(options);
         setServerSearchMessage(
           options.length ? `${options.length} server ditemukan.` : "Server tidak ditemukan. Coba nama broker atau server yang lebih singkat."
@@ -734,10 +987,10 @@ export function AccountPanel() {
     setConnectingAccount(true);
     setAccountMessage("");
     const formData = new FormData(form);
-    const mode = String(formData.get("execution_mode") || "EA");
     const payload = {
-      execution_mode: mode,
-      plan: mode === "MANAGED" ? "MANAGED" : selectedVps ? `EA_${selectedVps}` : "EA",
+      execution_mode: "MANAGED",
+      plan: "RENTAL",
+      rental_days: rentalDays,
       label: formData.get("label"),
       server: formData.get("server"),
       login: formData.get("login"),
@@ -819,7 +1072,7 @@ export function AccountPanel() {
       <div className="page-heading">
         <div>
           <span className="eyebrow">PORTAL KLIEN / COPY TRADING</span>
-          <h1>Akun Copy Trading</h1>
+          <h1>Sewa Server MT5</h1>
           <p className="page-description">
             Daftarkan akun follower dan atur layanan salin posisi dari portal ini.
           </p>
@@ -830,10 +1083,10 @@ export function AccountPanel() {
       </div>
 
       <section>
-        <h2>Hubungkan akun Copy Trading</h2>
+        <h2>Mulai sewa server</h2>
         {hasExistingPackage && !showAccountForm ? (
           <>
-            <p className="section-help">Paket Copy Trading Anda sudah terdaftar. Gunakan aksi di bawah untuk melihat transaksi atau mendaftarkan akun tambahan.</p>
+            <p className="section-help">Sewa server Anda sudah terdaftar. Lihat transaksi atau pesan masa sewa untuk akun tambahan.</p>
             <div className="account-primary-actions">
               <a className="account-action-button account-action-button--secondary" href="/transactions">Riwayat transaksi dan nota</a>
               <button className="account-action-button" type="button" onClick={() => setShowAccountForm(true)}>Hubungkan akun lain</button>
@@ -842,12 +1095,27 @@ export function AccountPanel() {
         ) : (
         <>
         <p className="section-help">
-          Pilih cara menjalankan akun, layanan, dan detail akun broker. Akun dibuat
-          setelah pembayaran disetujui. Untuk layanan dikelola server, password
-          broker dienkripsi dan hanya dikirim ke worker copier yang terautentikasi.
+          Sewa server MT5 dibayar di muka. Setelah pembayaran terverifikasi, pilih EA dari server atau unggah EA Anda untuk dipasang otomatis.
         </p>
         <form id="account-form" onSubmit={handleConnectSubmit}>
           <fieldset className="plan-picker plan-picker--compact">
+            <legend>Sewa server</legend>
+            <label>
+              Lama sewa (hari, minimal 10)
+              <input type="number" min={10} max={10000} step={1} required value={rentalDays}
+                onChange={(event) => setRentalDays(Math.max(10, Number(event.currentTarget.value) || 10))} />
+            </label>
+            <div className="price-list">
+              <div className="price-row">
+                <span className="price-row__body">
+                  <span className="price-row__name">Sewa server harian</span>
+                  <span className="price-row__desc">Rp 2.000 per hari · minimal 10 hari</span>
+                </span>
+                <span className="price-row__price">Rp {formatInteger(totalIdr)}</span>
+              </div>
+            </div>
+          </fieldset>
+          <fieldset hidden className="plan-picker plan-picker--compact">
             <legend>Cara menjalankan copy trading</legend>
             <div
               className="price-list"
@@ -915,7 +1183,7 @@ export function AccountPanel() {
               </label>
             </div>
           </fieldset>
-          <p
+          <p hidden
             id="managed-copy-service-status"
             className="status"
             role="status"
@@ -923,7 +1191,7 @@ export function AccountPanel() {
           >
             {serviceStatus}
           </p>
-          <fieldset className="plan-picker plan-picker--compact">
+          <fieldset hidden className="plan-picker plan-picker--compact">
             <legend>Biaya layanan</legend>
             {pricing ? (
               executionMode === "MANAGED" ? (
@@ -1020,11 +1288,7 @@ export function AccountPanel() {
             ) : (
               <p className="status">Memuat harga layanan…</p>
             )}
-            <p className="field-help">
-              Harga mengikuti pengaturan layanan. Pembayaran sementara
-              dilakukan manual dan diperiksa admin. Jangan transfer sebelum
-              melihat instruksi pada pesanan Anda.
-            </p>
+            <p className="field-help">Pembayaran manual, diperiksa admin.</p>
           </fieldset>
           <div className="account-fields">
             <label>
@@ -1093,10 +1357,7 @@ export function AccountPanel() {
                 </>
               )}
               <span id="broker-server-help" className="field-help" role="status">
-                {serverSearchBusy ? "Mencari direktori server MT5…" : serverSearchMessage || "Pilih server yang tercantum pada detail akun broker Anda."}
-              </span>
-              <span className="field-help">
-                Pencarian hanya mengirim teks broker/server; nomor akun dan password tidak dikirim.
+                {serverSearchBusy ? "Mencari direktori server MT5…" : serverSearchMessage || "Ketik minimal 3 karakter."}
               </span>
               <button
                 type="button"
@@ -1107,7 +1368,7 @@ export function AccountPanel() {
                   setSelectedBrokerServer("");
                 }}
               >
-                {manualServerEntry ? "Pilih dari hasil pencarian" : "Nama server tidak ada? Masukkan manual"}
+                {manualServerEntry ? "Pilih dari Daftar Server" : "Input Manual"}
               </button>
             </div>
             <label>
@@ -1118,14 +1379,10 @@ export function AccountPanel() {
                 inputMode="numeric"
                 pattern="[0-9]+"
                 title="Nomor akun MT5 hanya boleh berisi angka"
-                aria-describedby="account-login-help"
                 required
                 onInput={handleLoginInput}
                 onInvalid={handleLoginInvalid}
               />
-              <span id="account-login-help" className="field-help">
-                Masukkan nomor login MT5 berupa angka saja, tanpa spasi.
-              </span>
             </label>
           </div>
           <div className="form-actions">
@@ -1161,14 +1418,10 @@ export function AccountPanel() {
 
       <section>
         <h2>Saldo dan performa akun</h2>
-        <p className="section-help">
-          Saldo, profit harian, dan riwayat transaksi setiap akun dilaporkan
-          langsung dari MT5.
-        </p>
         <div id="client-balance-groups" className="account-perf-list">
           {accounts.length === 0 ? (
             <p className="empty-state">
-              Saldo akan tampil setelah akun MT5 ditambahkan dan melapor.
+              Belum ada data saldo.
             </p>
           ) : (
             accounts.map((account) => (
@@ -1184,7 +1437,7 @@ export function AccountPanel() {
         <div id="client-performance-groups" className="grid client-performance-groups">
           {performanceGroups.length === 0 ? (
             <p className="empty-state">
-              Belum ada transaksi tertutup yang dilaporkan oleh MT5.
+              Belum ada transaksi tertutup.
             </p>
           ) : (
             performanceGroups.map((group) => (
@@ -1217,18 +1470,13 @@ export function AccountPanel() {
         </div>
         <p id="client-performance-updated" className="muted" aria-live="polite">
           {performance?.updated_at
-            ? `Pembaruan MT5 terakhir ${wib(performance.updated_at)} WIB.`
-            : "Belum menerima data saldo MT5."}
+            ? `Diperbarui ${wib(performance.updated_at)} WIB`
+            : "Belum ada data MT5."}
         </p>
       </section>
 
       <section>
         <h2>Akun Copy Trading Anda</h2>
-        <p className="section-help">
-          Kelola hingga 10 akun. Pilih <strong>Mulai copy trading</strong> hanya
-          setelah mengecek login, ukuran lot, dan batas risiko. Job server akan
-          menjalankan order live pada akun broker Anda.
-        </p>
         <div id="accounts" className="grid">
           {accounts.length === 0 ? (
             <p className="empty-state">Belum ada akun MT5.</p>
@@ -1268,42 +1516,30 @@ export function AccountPanel() {
 
       <section id="ea-install-section" hidden={!hasEaAccount}>
         <h2>Pasang EA Copy Trading</h2>
-        <p className="section-help">
-          Petunjuk ini berlaku untuk akun yang memilih menjalankan EA sendiri.
-          Akun yang dikelola server tidak perlu mengikuti langkah MT5 ini di
-          komputer client.
-        </p>
+        <p className="section-help">Hanya untuk akun yang menjalankan EA sendiri.</p>
         <div className="toolbar">
           <a
             className="workspace-tag ea-download-button"
-            href="/api/core/downloads/MT5FollowerCopyEA.mq5"
+            href="/downloads/MT5FollowerCopyEA.mq5"
           >
             Unduh source EA Copy Trading
           </a>
         </div>
         <ol>
+          <li>Hubungkan akun di atas dan salin token (hanya tampil sekali).</li>
           <li>
-            Hubungkan akun Copy Trading di atas. Salin token yang muncul; token
-            hanya terlihat saat dibuat atau dirotasi.
+            File → Open Data Folder → <code>MQL5/Experts</code>, salin file{" "}
+            <code>.mq5</code>, lalu compile di MetaEditor (F7).
           </li>
           <li>
-            Di MT5, pilih File → Open Data Folder, buka folder{" "}
-            <code>MQL5/Experts</code>, lalu salin file <code>.mq5</code> yang
-            diunduh ke sana. Buka file itu di MetaEditor dan tekan F7; hasil compile <code>.ex5</code> siap digunakan
-            di folder tersebut.
-          </li>
-          <li>
-            Di MT5, pilih Tools → Options → Expert Advisors, aktifkan Allow WebRequest for listed URL, lalu tambahkan{" "}
+            Tools → Options → Expert Advisors → Allow WebRequest, tambahkan{" "}
             <code>{rootUrl || "root URL situs ini"}</code>.
           </li>
           <li>
-            Dari Navigator → Expert Advisors, pasang EA Copy Trading di chart. Isi <code>AccountToken</code> dengan token akun tersebut, pastikan <code>ServerURL</code> benar, lalu aktifkan Algo Trading.
+            Pasang EA di chart, isi <code>AccountToken</code> dan{" "}
+            <code>ServerURL</code>, lalu aktifkan Algo Trading.
           </li>
-          <li>
-            Pastikan EA utama Algentra aktif. EA Copy Trading akan menyalin posisi
-            live saat izin trading MT5 aktif; atur{" "}
-            <code>VolumeMultiplier</code> sesuai kebutuhan sebelum menjalankannya.
-          </li>
+          <li>Atur <code>VolumeMultiplier</code> sebelum menjalankan.</li>
         </ol>
         <div
           className="notice-box"
@@ -1312,33 +1548,25 @@ export function AccountPanel() {
         >
           <h3>Arti pesan di chart MT5</h3>
           <p>
-            <strong>HTTP -1 / ERROR 4006:</strong> EA belum mendapat jawaban dari
-            server. Kode 4006 berarti MT5 menemukan data array yang tidak valid
-            saat EA berjalan; pesan ini sendiri belum membuktikan token salah.
-            Pastikan URL <code>ServerURL</code> sama dengan alamat yang diizinkan
-            di <em>Allow WebRequest</em>. Jika masih muncul, kirim tangkapan tab{" "}
-            <strong>Experts</strong> kepada dukungan. Jangan kirim token.
+            <strong>HTTP -1 / ERROR 4006:</strong> EA belum mendapat jawaban.
+            Samakan <code>ServerURL</code> dengan alamat di{" "}
+            <em>Allow WebRequest</em>.
           </p>
           <p>
-            <strong>TRADING OFF:</strong> Periksa <strong>Algo Trading</strong>{" "}
-            serta izin trading terminal, akun, dan Expert Advisor di MT5.
+            <strong>TRADING OFF:</strong> Aktifkan <strong>Algo Trading</strong>{" "}
+            dan izin trading akun.
           </p>
         </div>
         <p className="notice-box">
-          Akun Copy Trading harus memakai mode <strong>hedging</strong>. Volume
-          salinan mengikuti volume sumber dikalikan{" "}
-          <code>VolumeMultiplier</code>; nilainya tidak menyesuaikan ekuitas
-          secara otomatis. Jika pembaruan dari akun utama terhenti lebih dari 20
-          detik, sinkronisasi berhenti. Posisi yang sudah terbuka tetap berada di
-          MT5 jika EA berhenti.
+          Akun harus mode <strong>hedging</strong>. Volume = volume sumber ×{" "}
+          <code>VolumeMultiplier</code>. Sinkronisasi berhenti jika akun utama
+          tidak memperbarui lebih dari 20 detik.
         </p>
         <p className="section-help">
-          Jangan bagikan token EA. Jika token hilang atau terekspos, pilih{" "}
-          <strong>Rotasi token</strong> dan perbarui token di EA Copy Trading.
+          Jangan bagikan token. Jika bocor, pilih <strong>Rotasi token</strong>.
         </p>
       </section>
 
-      <CsChatWidget mode="client" className="cs-chat-widget--account" />
     </main>
   );
 }

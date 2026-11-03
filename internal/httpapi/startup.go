@@ -3,15 +3,14 @@ package httpapi
 import (
 	"context"
 	"errors"
+	dbstore "github.com/rnpproject/algentra-backend/internal/database"
 	"log/slog"
 	"time"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // EnsureStartupSettings preserves the defaults seeded by the previous API
 // startup and removes controls retired by the current risk model.
-func EnsureStartupSettings(ctx context.Context, pool *pgxpool.Pool) error {
+func EnsureStartupSettings(ctx context.Context, pool *dbstore.Pool) error {
 	if pool == nil {
 		return errors.New("database pool wajib tersedia")
 	}
@@ -43,7 +42,7 @@ func EnsureStartupSettings(ctx context.Context, pool *pgxpool.Pool) error {
 	return tx.Commit(ctx)
 }
 
-func PurgeExpiredConversations(ctx context.Context, pool *pgxpool.Pool) error {
+func PurgeExpiredConversations(ctx context.Context, pool *dbstore.Pool) error {
 	if pool == nil {
 		return errors.New("database pool wajib tersedia")
 	}
@@ -51,7 +50,7 @@ func PurgeExpiredConversations(ctx context.Context, pool *pgxpool.Pool) error {
 	return err
 }
 
-func CleanupExpiredConversationsPeriodically(ctx context.Context, pool *pgxpool.Pool) {
+func CleanupExpiredConversationsPeriodically(ctx context.Context, pool *dbstore.Pool) {
 	ticker := time.NewTicker(15 * time.Minute)
 	defer ticker.Stop()
 	for {

@@ -1,4 +1,4 @@
-{
+﻿{
   "openapi": "3.1.0",
   "info": {
     "title": "Algentra Capital",
@@ -1183,7 +1183,7 @@
           "dashboard"
         ],
         "summary": "Realtime Stream",
-        "description": "Stream dashboard snapshots to browsers through the Vercel BFF.",
+        "description": "Stream dashboard snapshots to browsers through the same-origin Cloudflare Tunnel route.",
         "operationId": "realtime_stream_api_realtime_stream_get",
         "responses": {
           "200": {
@@ -1793,7 +1793,7 @@
           "dashboard"
         ],
         "summary": "Realtime Stream",
-        "description": "Stream dashboard snapshots to browsers through the Vercel BFF.",
+        "description": "Stream dashboard snapshots to browsers through the same-origin Cloudflare Tunnel route.",
         "operationId": "realtime_stream_v1_dashboard_realtime_stream_get",
         "responses": {
           "200": {
@@ -6030,7 +6030,7 @@
           "payments"
         ],
         "summary": "Create Qris Payment",
-        "description": "Buat transaksi QRIS Midtrans untuk order. Mengembalikan URL kode QR.",
+        "description": "Buat transaksi QRIS AirPay untuk order. Mengembalikan URL kode QR.",
         "operationId": "create_qris_payment_api_payments_orders__order_id__qris_post",
         "parameters": [
           {
@@ -6118,7 +6118,7 @@
           "payments"
         ],
         "summary": "Sync Qris Payment",
-        "description": "Cek status langsung ke Midtrans (fallback bila webhook tidak sampai).",
+        "description": "Cek status langsung ke AirPay dengan polling status.",
         "operationId": "sync_qris_payment_api_payments_orders__order_id__qris_sync_post",
         "parameters": [
           {
@@ -6436,7 +6436,7 @@
           "payments"
         ],
         "summary": "Create Qris Payment",
-        "description": "Buat transaksi QRIS Midtrans untuk order. Mengembalikan URL kode QR.",
+        "description": "Buat transaksi QRIS AirPay untuk order. Mengembalikan URL kode QR.",
         "operationId": "create_qris_payment_v1_payments_orders__order_id__qris_post",
         "parameters": [
           {
@@ -6524,7 +6524,7 @@
           "payments"
         ],
         "summary": "Sync Qris Payment",
-        "description": "Cek status langsung ke Midtrans (fallback bila webhook tidak sampai).",
+        "description": "Cek status langsung ke AirPay dengan polling status.",
         "operationId": "sync_qris_payment_v1_payments_orders__order_id__qris_sync_post",
         "parameters": [
           {

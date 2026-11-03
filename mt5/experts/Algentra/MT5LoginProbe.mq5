@@ -5,9 +5,11 @@
 input string ProbeStatusFileName = "algentra-login-probe.json";
 bool g_status_write_error_logged = false;
 string g_last_status_log = "";
-bool g_gold_chart_ready = false;
+string g_last_gold_symbol_log = "";
 datetime g_gold_chart_last_log = 0;
 datetime g_gold_chart_last_check = 0;
+ulong g_last_single_chart_check_ms = 0;
+string g_probe_gold_symbol = "";
 
 string EscapeJSON(string value)
   {
@@ -41,12 +43,14 @@ void WriteStatusToFile(const string file_name,
    g_status_write_error_logged = false;
    string safe_message = EscapeJSON(message);
    string server = EscapeJSON(AccountInfoString(ACCOUNT_SERVER));
-   FileWriteString(file, StringFormat("{\"ready\":%s,\"valid\":%s,\"message\":\"%s\",\"login\":%I64d,\"server\":\"%s\"}",
+   string selected_symbol = EscapeJSON(g_probe_gold_symbol);
+   FileWriteString(file, StringFormat("{\"ready\":%s,\"valid\":%s,\"message\":\"%s\",\"login\":%I64d,\"server\":\"%s\",\"symbol\":\"%s\"}",
                                       ready ? "true" : "false",
                                       valid ? "true" : "false",
                                       safe_message,
                                       AccountInfoInteger(ACCOUNT_LOGIN),
-                                      server));
+                                      server,
+                                      selected_symbol));
    FileFlush(file);
    FileClose(file);
   }
@@ -55,12 +59,14 @@ void WriteStatus(const bool ready, const bool valid, const string message)
   {
    string safe_message = EscapeJSON(message);
    string server = EscapeJSON(AccountInfoString(ACCOUNT_SERVER));
-   string payload = StringFormat("{\"ready\":%s,\"valid\":%s,\"message\":\"%s\",\"login\":%I64d,\"server\":\"%s\"}",
+   string selected_symbol = EscapeJSON(g_probe_gold_symbol);
+   string payload = StringFormat("{\"ready\":%s,\"valid\":%s,\"message\":\"%s\",\"login\":%I64d,\"server\":\"%s\",\"symbol\":\"%s\"}",
                                   ready ? "true" : "false",
                                   valid ? "true" : "false",
                                   safe_message,
                                   AccountInfoInteger(ACCOUNT_LOGIN),
-                                  server);
+                                  server,
+                                  selected_symbol);
    // Give the worker a log-based fallback if terminal file access is blocked.
    if(payload != g_last_status_log)
      {
@@ -81,45 +87,63 @@ bool ResolveGoldSymbol(string &resolved)
    string best_upper = "";
    long best_quote_time = 0;
    int best_history = 0; // 1 when the broker actually serves M1 bars for this symbol
-   int best_exact_rank = 1;
+   int best_exact_rank = 0;
    int best_suffix_length = 2147483647;
+   int best_data_rank = -1; // fresh quote > local/server M1 history > catalog only
    int symbols_total = SymbolsTotal(false);
    for(int i = 0; i < symbols_total; i++)
      {
       string candidate = SymbolName(i, false);
       string upper = candidate;
       StringToUpper(upper);
-      if(StringLen(candidate) < 6 || StringSubstr(upper, 0, 6) != "XAUUSD")
+      if(SymbolInfoInteger(candidate, SYMBOL_TRADE_MODE) == SYMBOL_TRADE_MODE_DISABLED ||
+         !SymbolSelect(candidate, true))
          continue;
-      if(SymbolInfoInteger(candidate, SYMBOL_TRADE_MODE) == SYMBOL_TRADE_MODE_DISABLED)
+      string base_currency = SymbolInfoString(candidate, SYMBOL_CURRENCY_BASE);
+      string profit_currency = SymbolInfoString(candidate, SYMBOL_CURRENCY_PROFIT);
+      StringToUpper(base_currency);
+      StringToUpper(profit_currency);
+      bool gold_candidate = (StringLen(candidate) >= 6 && StringSubstr(upper, 0, 6) == "XAUUSD") ||
+                           (base_currency == "XAU" && profit_currency == "USD");
+      if(!gold_candidate)
          continue;
-      // Select matching gold variants so MT5 can load quotes for the account's
-      // actual instrument before choosing between XAUUSD, XAUUSDc, XAUUSDm, etc.
-      SymbolSelect(candidate, true);
       MqlTick tick;
       long quote_time = 0;
       if(SymbolInfoTick(candidate, tick) && tick.bid > 0.0 && tick.ask > 0.0)
          quote_time = tick.time_msc > 0 ? tick.time_msc : (long)tick.time * 1000;
       long server_now = (long)TimeTradeServer() * 1000;
-      // On weekends/closed sessions, stale ticks cannot identify the account's
-      // instrument. In that case prefer a broker suffix over the bare symbol.
+      // Ignore stale ticks so a weekend/closed market falls back to history
+      // and then a broker suffix instead of preferring an inactive bare symbol.
       if(server_now > 0 && quote_time < server_now - 30 * 60 * 1000)
          quote_time = 0;
-      int suffix_length = StringLen(candidate) - 6;
-      int exact_rank = suffix_length == 0 ? 1 : 0;
-      // A symbol can exist in the broker catalog (e.g. bare XAUUSD) without the
-      // account receiving any data for it, which gives a black chart. Symbols
-      // that actually have bars always outrank those that do not.
+      bool has_xauusd_prefix = StringSubstr(upper, 0, 6) == "XAUUSD";
+      int suffix_length = has_xauusd_prefix ? StringLen(candidate) - 6 : StringLen(candidate);
+      // When no quote/history is available yet, prefer the broker's suffixed
+      // instrument over a bare catalog placeholder such as XAUUSD.
+      int exact_rank = suffix_length == 0 ? 0 : 1;
+      // A bare catalog entry can exist without account data. A fresh quote is
+      // strongest evidence of the active account instrument; history is next.
       int history = SeriesInfoInteger(candidate, PERIOD_M1, SERIES_BARS_COUNT) > 0 ? 1 : 0;
-      bool same_data = (history == best_history && quote_time == best_quote_time);
-      if(best == "" || history > best_history ||
-         (history == best_history && quote_time > best_quote_time) ||
-         (same_data && exact_rank < best_exact_rank) ||
-         (same_data && exact_rank == best_exact_rank && suffix_length < best_suffix_length) ||
-         (same_data && exact_rank == best_exact_rank && suffix_length == best_suffix_length && upper < best_upper))
+      int data_rank = quote_time > 0 ? 2 : (history > 0 ? 1 : 0);
+      bool better = best == "" || data_rank > best_data_rank;
+      if(!better && data_rank == best_data_rank)
+        {
+         if(data_rank == 2 && quote_time != best_quote_time)
+            better = quote_time > best_quote_time;
+         else if(history != best_history)
+            better = history > best_history;
+         else if(exact_rank != best_exact_rank)
+            better = exact_rank > best_exact_rank;
+         else if(suffix_length != best_suffix_length)
+            better = suffix_length < best_suffix_length;
+         else
+            better = upper < best_upper;
+        }
+      if(better)
         {
          best = candidate;
          best_upper = upper;
+         best_data_rank = data_rank;
          best_history = history;
          best_quote_time = quote_time;
          best_exact_rank = exact_rank;
@@ -132,33 +156,30 @@ bool ResolveGoldSymbol(string &resolved)
    return true;
   }
 
+void KeepSingleProbeChart()
+  {
+   ulong now_ms = GetTickCount64();
+   if(g_last_single_chart_check_ms > 0 && now_ms - g_last_single_chart_check_ms < 5000)
+      return;
+   g_last_single_chart_check_ms = now_ms;
+   long active_chart = ChartID();
+   long chart_id = ChartFirst();
+   while(chart_id >= 0)
+     {
+      long next_chart = ChartNext(chart_id);
+      if(chart_id != active_chart)
+         ChartClose(chart_id);
+      chart_id = next_chart;
+     }
+   ChartSetInteger(active_chart, CHART_BRING_TO_TOP, true);
+   ChartRedraw(active_chart);
+  }
+
 void EnsureDefaultGoldChart()
   {
-   if(g_gold_chart_ready && TimeCurrent() - g_gold_chart_last_check < 10)
+   if(g_gold_chart_last_check > 0 && TimeCurrent() - g_gold_chart_last_check < 10)
       return;
    g_gold_chart_last_check = TimeCurrent();
-
-   // Shared rule with MT5FollowerCopyEA: if the chart already shows any tradable
-   // XAUUSD variant, keep it, so the two EAs never switch the chart back and
-   // forth between XAUUSD and XAUUSDc/m. Each switch also reloads the EA.
-   string current_symbol = _Symbol;
-   string current_upper = current_symbol;
-   StringToUpper(current_upper);
-   // Only keep it when it really has data: an XAUUSD chart that is black
-   // (no bars) must be replaced by the variant the account supports.
-   if(StringFind(current_upper, "XAUUSD") == 0 &&
-      SymbolInfoInteger(current_symbol, SYMBOL_TRADE_MODE) != SYMBOL_TRADE_MODE_DISABLED &&
-      SeriesInfoInteger(current_symbol, PERIOD_M1, SERIES_BARS_COUNT) > 0)
-     {
-      if(_Period == PERIOD_M1)
-        {
-         g_gold_chart_ready = true;
-         return;
-        }
-      ResetLastError();
-      ChartSetSymbolPeriod(0, current_symbol, PERIOD_M1); // change timeframe only
-      return;
-     }
 
    string gold_symbol;
    if(!ResolveGoldSymbol(gold_symbol))
@@ -170,15 +191,26 @@ void EnsureDefaultGoldChart()
         }
       return;
      }
+   if(g_last_gold_symbol_log != gold_symbol)
+     {
+      Print("[MT5LoginProbe] simbol gold dari katalog akun: ", gold_symbol);
+      g_last_gold_symbol_log = gold_symbol;
+     }
    if(_Symbol == gold_symbol && _Period == PERIOD_M1)
      {
-      g_gold_chart_ready = true;
+      int bars = (int)SeriesInfoInteger(gold_symbol, PERIOD_M1, SERIES_BARS_COUNT);
+      if(bars > 0)
+         Print("[MT5LoginProbe] chart probe siap: ", gold_symbol, ", M1, bars=", bars);
+      else if(TimeCurrent() - g_gold_chart_last_log >= 15)
+        {
+         Print("[MT5LoginProbe] menunggu riwayat M1 untuk simbol gold akun: ", gold_symbol);
+         g_gold_chart_last_log = TimeCurrent();
+        }
       return;
      }
    ResetLastError();
    if(ChartSetSymbolPeriod(0, gold_symbol, PERIOD_M1))
      {
-      g_gold_chart_ready = true;
       Print("[MT5LoginProbe] chart probe memakai ", gold_symbol, ", M1.");
      }
    else if(TimeCurrent() - g_gold_chart_last_log >= 15)
@@ -191,8 +223,16 @@ void EnsureDefaultGoldChart()
 
 int OnInit()
   {
+   // This terminal is short-lived and only validates broker authentication.
+   // Report immediately; chart discovery/history requests belong to the
+   // persistent copier EA and must not delay the portal's login result.
    WriteStatus(false, false, "Menunggu koneksi broker MT5.");
-   if(!EventSetTimer(1)) return INIT_FAILED;
+   KeepSingleProbeChart();
+   if(!EventSetTimer(1))
+     {
+      Print("[MT5LoginProbe] gagal mengaktifkan timer; error ", GetLastError());
+      return INIT_FAILED;
+     }
    return INIT_SUCCEEDED;
   }
 
@@ -203,7 +243,8 @@ void OnDeinit(const int reason)
 
 void OnTimer()
   {
-   EnsureDefaultGoldChart();
+   // One terminal, one chart: close charts restored from the template profile.
+   KeepSingleProbeChart();
    if(!TerminalInfoInteger(TERMINAL_CONNECTED) || AccountInfoInteger(ACCOUNT_LOGIN) <= 0)
      {
       WriteStatus(false, false, "Menunggu koneksi broker MT5.");
@@ -224,5 +265,26 @@ void OnTimer()
       WriteStatus(true, false, "Login berhasil, tetapi Expert tidak diizinkan trading (Allow Algo Trading pada Expert).");
       return;
      }
-   WriteStatus(true, true, "Login broker berhasil dan terminal siap untuk copy trading.");
+   if(g_probe_gold_symbol == "")
+     {
+      WriteStatus(false, false, "Login broker berhasil; sedang memilih simbol gold yang didukung akun.");
+      if(!ResolveGoldSymbol(g_probe_gold_symbol))
+        {
+         WriteStatus(true, false, "Login berhasil, tetapi simbol gold XAUUSD tidak ditemukan pada daftar simbol akun.");
+         return;
+        }
+      Print("[MT5LoginProbe] simbol gold akun terpilih saat login: ", g_probe_gold_symbol);
+     }
+   if(_Symbol != g_probe_gold_symbol || _Period != PERIOD_M1)
+     {
+      ResetLastError();
+      if(!ChartSetSymbolPeriod(0, g_probe_gold_symbol, PERIOD_M1))
+        {
+         WriteStatus(true, false, "Login berhasil, tetapi chart tidak dapat dialihkan ke simbol akun " + g_probe_gold_symbol + ".");
+         return;
+        }
+      WriteStatus(false, false, "Login broker berhasil; memilih " + g_probe_gold_symbol + " pada timeframe M1.");
+      return;
+     }
+   WriteStatus(true, true, "Login broker berhasil; simbol akun " + g_probe_gold_symbol + " dipilih pada M1.");
   }

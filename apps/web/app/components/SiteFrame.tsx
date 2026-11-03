@@ -3,6 +3,8 @@
 import { useCallback, useEffect, useState, type MouseEvent as ReactMouseEvent } from "react";
 import { usePathname } from "next/navigation";
 import { apiRequest } from "../lib/api";
+import { MusicToggle } from "./MusicToggle";
+import { CsChatWidget } from "./CsChatWidget";
 
 type SessionInfo = { admin: boolean; client: boolean; csrf_token?: string };
 
@@ -416,6 +418,12 @@ export function SiteFrame({ children }: { children: React.ReactNode }) {
         </div>
       </header>
       {children}
+      {!isAdmin && pathname !== "/dashboard" && !pathname.startsWith("/admin") && (
+        <CsChatWidget
+          mode={pathname === "/account" || pathname.startsWith("/transactions") ? "client" : "public"}
+        />
+      )}
+      <MusicToggle alone={isAdmin || pathname === "/dashboard" || pathname.startsWith("/admin")} />
       <footer>
         {isAdmin ? (
           <>
