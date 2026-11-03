@@ -243,7 +243,10 @@ CREATE TABLE IF NOT EXISTS mt5_accounts (
     custom_ea_name VARCHAR(128),
     custom_ea_data BLOB,
     custom_ea_updated_at TEXT,
-    FOREIGN KEY(owner_id) REFERENCES client_users (id) ON DELETE CASCADE, 
+    custom_ea_inputs TEXT,
+    custom_ea_params TEXT,
+    custom_ea_paused INTEGER NOT NULL DEFAULT 0,
+    FOREIGN KEY(owner_id) REFERENCES client_users (id) ON DELETE CASCADE,
     CONSTRAINT ux_mt5_owner_server_login UNIQUE (owner_id, server, login)
 );
 

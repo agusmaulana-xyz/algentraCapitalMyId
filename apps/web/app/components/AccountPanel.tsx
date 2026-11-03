@@ -63,6 +63,7 @@ type Account = {
   rental_expires_at?: string | null;
   ea_mode?: string | null;
   custom_ea_name?: string | null;
+  custom_ea_paused?: boolean;
   active: boolean;
   last_seen_at?: string | null;
   connection_status: string;
@@ -523,6 +524,23 @@ function ManagedAccountCard({
     }
   };
 
+  const handleCustomEAPaused = async (paused: boolean) => {
+    setEABusy(true);
+    setEAMessage("");
+    try {
+      await apiRequest(`mt5/accounts/${account.id}/custom-ea/paused`, {
+        method: "PUT",
+        body: JSON.stringify({ paused }),
+      });
+      setEAMessage(paused ? "EA sendiri dijeda. Laporan akun tetap berjalan." : "EA sendiri akan dijalankan oleh worker.");
+      onReload();
+    } catch (error) {
+      setEAMessage(error instanceof Error ? error.message : "Status EA gagal disimpan.");
+    } finally {
+      setEABusy(false);
+    }
+  };
+
   const handleCustomEAUpload = async () => {
     if (!customEAFile) {
       setEAMessage("Pilih file EA .mq5 atau .ex5 terlebih dahulu.");
@@ -661,6 +679,15 @@ function ManagedAccountCard({
         <button type="button" className="secondary" disabled={eaBusy || !customEAFile} onClick={() => void handleCustomEAUpload()}>
           {eaBusy ? "Memproses…" : "Unggah EA sendiri"}
         </button>
+        {account.ea_mode === "CUSTOM" ? (
+          <div className="toolbar">
+            <button type="button" disabled={eaBusy} onClick={() => void handleCustomEAPaused(!account.custom_ea_paused)}>
+              {account.custom_ea_paused ? "Jalankan EA sendiri" : "Pause EA sendiri"}
+            </button>
+            <span>{account.custom_ea_paused ? "Dijeda — atur parameter dulu sebelum dijalankan" : "EA sendiri berjalan"}</span>
+            <a className="button secondary" href={`/account/ea-params?account=${account.id}`}>Atur parameter EA</a>
+          </div>
+        ) : null}
         {eaMessage ? <p className="status" role="status">{eaMessage}</p> : null}
       </section>
       <p className={loginClass} role="status" aria-live="polite">
