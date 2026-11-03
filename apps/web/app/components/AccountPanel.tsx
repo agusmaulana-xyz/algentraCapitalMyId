@@ -405,12 +405,15 @@ function ManagedAccountCard({
     else if (!liveConfirmOpen && dialog?.open) dialog.close();
   }, [liveConfirmOpen]);
 
+  const savedLoginMessage = profile.login_message === "Login broker berhasil dan terminal siap untuk copy trading."
+    ? "Login broker tervalidasi dengan MT5 Login Probe. Terminal follower dijalankan oleh worker copier."
+    : profile.login_message;
   const loginMessages: Record<string, string> = {
     UNCHECKED: "Login belum diperiksa. Simpan kredensial untuk memeriksa.",
     CHECKING: "Memeriksa login broker…",
-    VALID: profile.login_message || "Login broker berhasil.",
+    VALID: savedLoginMessage || "Login broker tervalidasi melalui terminal MT5.",
     ERROR:
-      profile.login_message ||
+      savedLoginMessage ||
       "Login belum berhasil. Periksa data akun.",
   };
   const loginMessage =
@@ -900,7 +903,6 @@ export function AccountPanel() {
   const [tokenCopied, setTokenCopied] = useState(false);
   const managedFormDirty = useRef(false);
   const modeTouched = useRef(false);
-  const lastRealtimeEventAt = useRef(0);
 
   const managedWorkerReady = copier?.available === true;
   const serviceStatus = !copier
@@ -911,7 +913,7 @@ export function AccountPanel() {
         ? "Worker managed copy offline. Layanan managed belum dapat dipesan atau dimulai."
         : "Layanan managed belum dikonfigurasi di server. Anda tetap dapat memilih Pasang EA sendiri.";
 
-  const loadAccounts = useCallback(async () => {
+  const loadAccounts = useCallback(async (quiet = false) => {
     try {
       const [accountList, perfData, copierStatus] = await Promise.all([
         apiRequest<Account[]>("mt5/accounts"),
@@ -932,9 +934,11 @@ export function AccountPanel() {
         setCopier(null);
         setTokenBox(null);
       }
-      setAccountMessage(
-        error instanceof Error ? error.message : "Permintaan tidak berhasil."
-      );
+      if (!quiet) {
+        setAccountMessage(
+          error instanceof Error ? error.message : "Permintaan tidak berhasil."
+        );
+      }
       return false;
     }
   }, []);
@@ -948,13 +952,10 @@ export function AccountPanel() {
       .then(setPricing)
       .catch(() => {});
     void loadAccounts();
-    lastRealtimeEventAt.current = Date.now();
     const stream = new EventSource("/api/mt5/stream");
     let cancelled = false;
-    let fallbackBusy = false;
-    let streamFailed = false;
+    let refreshBusy = false;
     const markRealtime = () => {
-      lastRealtimeEventAt.current = Date.now();
       setRealtimeStatus(`Realtime tersambung · ${new Date().toLocaleTimeString("en-GB")}`);
     };
     const applySnapshot = (event: MessageEvent<string>) => {
@@ -991,38 +992,34 @@ export function AccountPanel() {
     stream.addEventListener("mt5-accounts", applyAccounts as EventListener);
     stream.addEventListener("mt5-meta", applyMeta as EventListener);
     stream.onopen = () => {
-      streamFailed = false;
       setRealtimeStatus("Realtime tersambung melalui SSE.");
     };
     stream.onerror = () => {
-      streamFailed = true;
-      setRealtimeStatus("Realtime tertunda · mencoba pembaruan berkala…");
+      setRealtimeStatus("SSE terputus · memperbarui data lewat API…");
     };
-    // SSE mengirim perubahan akun dan status berkala. Jika koneksi macet/putus,
-    // gunakan REST sebagai fallback, dengan jeda agar request tidak menumpuk.
-    const fallbackTimer = window.setInterval(() => {
-      if (cancelled || document.hidden || fallbackBusy) return;
-      const stale = Date.now() - lastRealtimeEventAt.current > 20_000;
-      if (!streamFailed && !stale) return;
-      fallbackBusy = true;
-      void loadAccounts().then((ok) => {
-        if (!cancelled && ok) {
-          setRealtimeStatus(`Data diperbarui · ${new Date().toLocaleTimeString("en-GB")}`);
+    // Refresh account/performance data at the same cadence as the admin MT5
+    // panel. SSE remains the immediate update path; REST keeps it fresh even
+    // when a proxy or browser silently drops account events.
+    const refreshFromApi = () => {
+      if (cancelled || document.hidden || refreshBusy) return;
+      refreshBusy = true;
+      void loadAccounts(true).then((ok) => {
+        if (!cancelled) {
+          setRealtimeStatus(ok
+            ? `Data diperbarui · ${new Date().toLocaleTimeString("en-GB")}`
+            : "Pembaruan data tertunda · mencoba lagi…");
         }
-      }).finally(() => { fallbackBusy = false; });
-    }, 5_000);
+      }).finally(() => { refreshBusy = false; });
+    };
+    const refreshTimer = window.setInterval(refreshFromApi, 3_000);
     const onVisible = () => {
-      if (document.hidden || cancelled || fallbackBusy) return;
-      fallbackBusy = true;
-      void loadAccounts().then((ok) => {
-        if (!cancelled && ok) setRealtimeStatus(`Data diperbarui · ${new Date().toLocaleTimeString("en-GB")}`);
-      }).finally(() => { fallbackBusy = false; });
+      refreshFromApi();
     };
     document.addEventListener("visibilitychange", onVisible);
     return () => {
       cancelled = true;
       stream.close();
-      window.clearInterval(fallbackTimer);
+      window.clearInterval(refreshTimer);
       document.removeEventListener("visibilitychange", onVisible);
     };
   }, [loadAccounts]);
