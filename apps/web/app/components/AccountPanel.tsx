@@ -882,6 +882,7 @@ export function AccountPanel() {
   const [pricing, setPricing] = useState<Pricing | null>(null);
   const [selectedVps, setSelectedVps] = useState<string | null>(null);
   const [accountMessage, setAccountMessage] = useState("");
+  const [realtimeStatus, setRealtimeStatus] = useState("Menghubungkan realtime…");
   const [connectingAccount, setConnectingAccount] = useState(false);
   const [serverSearch, setServerSearch] = useState("");
   const [serverOptions, setServerOptions] = useState<BrokerServerOption[]>([]);
@@ -899,6 +900,7 @@ export function AccountPanel() {
   const [tokenCopied, setTokenCopied] = useState(false);
   const managedFormDirty = useRef(false);
   const modeTouched = useRef(false);
+  const lastRealtimeEventAt = useRef(0);
 
   const managedWorkerReady = copier?.available === true;
   const serviceStatus = !copier
@@ -922,6 +924,7 @@ export function AccountPanel() {
       if (!modeTouched.current) {
         setExecutionMode(copierStatus.available === true ? "MANAGED" : "EA");
       }
+      return true;
     } catch (error) {
       if (error instanceof Error && /401|login diperlukan|unauthorized/i.test(error.message)) {
         setAccounts([]);
@@ -932,6 +935,7 @@ export function AccountPanel() {
       setAccountMessage(
         error instanceof Error ? error.message : "Permintaan tidak berhasil."
       );
+      return false;
     }
   }, []);
 
@@ -943,7 +947,16 @@ export function AccountPanel() {
     apiRequest<Pricing>("mt5/pricing")
       .then(setPricing)
       .catch(() => {});
+    void loadAccounts();
+    lastRealtimeEventAt.current = Date.now();
     const stream = new EventSource("/api/mt5/stream");
+    let cancelled = false;
+    let fallbackBusy = false;
+    let streamFailed = false;
+    const markRealtime = () => {
+      lastRealtimeEventAt.current = Date.now();
+      setRealtimeStatus(`Realtime tersambung · ${new Date().toLocaleTimeString("en-GB")}`);
+    };
     const applySnapshot = (event: MessageEvent<string>) => {
       try {
         const payload = JSON.parse(event.data) as { accounts?: Account[]; performance?: Performance; copier?: CopierStatus };
@@ -953,12 +966,14 @@ export function AccountPanel() {
           setCopier(payload.copier);
           if (!modeTouched.current) setExecutionMode(payload.copier.available ? "MANAGED" : "EA");
         }
+        markRealtime();
       } catch { /* Ignore malformed stream payloads; EventSource reconnects automatically. */ }
     };
     const applyAccounts = (event: MessageEvent<string>) => {
       try {
         const payload = JSON.parse(event.data) as { accounts?: Account[] };
         if (payload.accounts) setAccounts(payload.accounts);
+        markRealtime();
       } catch { /* Ignore malformed account events. */ }
     };
     const applyMeta = (event: MessageEvent<string>) => {
@@ -969,15 +984,48 @@ export function AccountPanel() {
           setCopier(payload.copier);
           if (!modeTouched.current) setExecutionMode(payload.copier.available ? "MANAGED" : "EA");
         }
+        markRealtime();
       } catch { /* Ignore malformed metadata events. */ }
     };
     stream.addEventListener("mt5-snapshot", applySnapshot as EventListener);
     stream.addEventListener("mt5-accounts", applyAccounts as EventListener);
     stream.addEventListener("mt5-meta", applyMeta as EventListener);
-    return () => {
-      stream.close();
+    stream.onopen = () => {
+      streamFailed = false;
+      setRealtimeStatus("Realtime tersambung melalui SSE.");
     };
-  }, []);
+    stream.onerror = () => {
+      streamFailed = true;
+      setRealtimeStatus("Realtime tertunda · mencoba pembaruan berkala…");
+    };
+    // SSE mengirim perubahan akun dan status berkala. Jika koneksi macet/putus,
+    // gunakan REST sebagai fallback, dengan jeda agar request tidak menumpuk.
+    const fallbackTimer = window.setInterval(() => {
+      if (cancelled || document.hidden || fallbackBusy) return;
+      const stale = Date.now() - lastRealtimeEventAt.current > 20_000;
+      if (!streamFailed && !stale) return;
+      fallbackBusy = true;
+      void loadAccounts().then((ok) => {
+        if (!cancelled && ok) {
+          setRealtimeStatus(`Data diperbarui · ${new Date().toLocaleTimeString("en-GB")}`);
+        }
+      }).finally(() => { fallbackBusy = false; });
+    }, 5_000);
+    const onVisible = () => {
+      if (document.hidden || cancelled || fallbackBusy) return;
+      fallbackBusy = true;
+      void loadAccounts().then((ok) => {
+        if (!cancelled && ok) setRealtimeStatus(`Data diperbarui · ${new Date().toLocaleTimeString("en-GB")}`);
+      }).finally(() => { fallbackBusy = false; });
+    };
+    document.addEventListener("visibilitychange", onVisible);
+    return () => {
+      cancelled = true;
+      stream.close();
+      window.clearInterval(fallbackTimer);
+      document.removeEventListener("visibilitychange", onVisible);
+    };
+  }, [loadAccounts]);
 
   useEffect(() => {
     const query = serverSearch.trim();
@@ -1508,6 +1556,7 @@ export function AccountPanel() {
             ? `Diperbarui ${wib(performance.updated_at)} WIB`
             : "Belum ada data MT5."}
         </p>
+        <p className="muted" aria-live="polite">{realtimeStatus}</p>
       </section>
 
       <section>
