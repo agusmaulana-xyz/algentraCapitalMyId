@@ -601,15 +601,15 @@ func (api copierAPI) reportAccount(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(ctx)
 	var active bool
-	var executionMode string
+	var executionMode, eaMode string
 	var ownerID int64
 	err = tx.QueryRow(ctx, `
-		SELECT p.active, a.execution_mode, a.owner_id
+		SELECT p.active, a.execution_mode, COALESCE(a.ea_mode, 'SERVER'), a.owner_id
 		FROM managed_copy_profiles AS p
 		JOIN mt5_accounts AS a ON a.id = p.account_id
 		WHERE p.account_id = $1
 		FOR UPDATE OF p
-	`, accountID).Scan(&active, &executionMode, &ownerID)
+	`, accountID).Scan(&active, &executionMode, &eaMode, &ownerID)
 	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "Akun managed copy tidak ditemukan")
 		return
@@ -622,7 +622,10 @@ func (api copierAPI) reportAccount(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "Akun managed copy tidak ditemukan")
 		return
 	}
-	if !active {
+	// Custom EA accounts keep a report-only MT5 terminal while copy execution
+	// is paused. Continue accepting its balance/history reports; this endpoint
+	// cannot execute trades and the worker key is required.
+	if !active && !strings.EqualFold(eaMode, "CUSTOM") {
 		writeError(w, http.StatusConflict, "Copy trading akun ini sedang dijeda")
 		return
 	}

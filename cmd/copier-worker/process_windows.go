@@ -6,12 +6,51 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
 
 	"golang.org/x/sys/windows"
 )
+
+// NewCallback allocates a process-lifetime Windows callback trampoline. Do not
+// call it from the periodic chart monitor: the Windows callback table is
+// finite, and MT5 chart enumeration runs every few seconds for each account.
+var (
+	windowEnumMu       sync.Mutex
+	activeWindowEnum   atomic.Pointer[windowEnumHandler]
+	windowEnumCallback = syscall.NewCallback(dispatchWindowEnum)
+)
+
+type windowEnumHandler struct {
+	callback func(windows.HWND) uintptr
+}
+
+func dispatchWindowEnum(hwnd uintptr, _ uintptr) uintptr {
+	handler := activeWindowEnum.Load()
+	if handler == nil {
+		return 1
+	}
+	return handler.callback(windows.HWND(hwnd))
+}
+
+func enumWindows(callback func(windows.HWND) uintptr) {
+	windowEnumMu.Lock()
+	defer windowEnumMu.Unlock()
+	activeWindowEnum.Store(&windowEnumHandler{callback: callback})
+	defer activeWindowEnum.Store(nil)
+	_ = windows.EnumWindows(windowEnumCallback, nil)
+}
+
+func enumChildWindows(parent windows.HWND, callback func(windows.HWND) uintptr) {
+	windowEnumMu.Lock()
+	defer windowEnumMu.Unlock()
+	activeWindowEnum.Store(&windowEnumHandler{callback: callback})
+	defer activeWindowEnum.Store(nil)
+	windows.EnumChildWindows(parent, windowEnumCallback, nil)
+}
 
 func manageMT5Charts(processID uint32, stopped <-chan struct{}, enforceSingle bool) {
 	// MT5 creates its chart window asynchronously after the process starts.
@@ -45,41 +84,40 @@ func maximizeMT5Charts(processID uint32) {
 	maximize := uintptr(3) // SW_MAXIMIZE
 	var mainWindow windows.HWND
 	var largestArea int64
-	_ = windows.EnumWindows(syscall.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
+	enumWindows(func(hwnd windows.HWND) uintptr {
 		var owner uint32
-		windows.GetWindowThreadProcessId(windows.HWND(hwnd), &owner)
-		if owner == processID && windows.IsWindowVisible(windows.HWND(hwnd)) {
+		windows.GetWindowThreadProcessId(hwnd, &owner)
+		if owner == processID && windows.IsWindowVisible(hwnd) {
 			var bounds struct{ Left, Top, Right, Bottom int32 }
-			if result, _, _ := getWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&bounds))); result != 0 {
+			if result, _, _ := getWindowRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&bounds))); result != 0 {
 				area := int64(bounds.Right-bounds.Left) * int64(bounds.Bottom-bounds.Top)
 				if area > largestArea {
-					mainWindow = windows.HWND(hwnd)
+					mainWindow = hwnd
 					largestArea = area
 				}
 			}
 		}
 		return 1
-	}), nil)
+	})
 	if mainWindow == 0 {
 		return
 	}
 	showWindow.Call(uintptr(mainWindow), maximize)
-	windows.EnumChildWindows(mainWindow, syscall.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
-		window := windows.HWND(hwnd)
+	enumChildWindows(mainWindow, func(window windows.HWND) uintptr {
 		if !windows.IsWindowVisible(window) {
 			return 1
 		}
-		length, _, _ := getWindowTextLength.Call(hwnd)
+		length, _, _ := getWindowTextLength.Call(uintptr(window))
 		if length == 0 || length > 256 {
 			return 1
 		}
 		buffer := make([]uint16, length+1)
-		getWindowText.Call(hwnd, uintptr(unsafe.Pointer(&buffer[0])), uintptr(len(buffer)))
+		getWindowText.Call(uintptr(window), uintptr(unsafe.Pointer(&buffer[0])), uintptr(len(buffer)))
 		if isMT5ChartWindowTitle(windows.UTF16ToString(buffer)) {
-			showWindow.Call(hwnd, maximize)
+			showWindow.Call(uintptr(window), maximize)
 		}
 		return 1
-	}), nil)
+	})
 }
 
 // requestMT5Close asks the terminal's main window to close normally (WM_CLOSE)
@@ -90,20 +128,20 @@ func requestMT5Close(processID uint32) {
 	postMessage := user32.NewProc("PostMessageW")
 	var mainWindow windows.HWND
 	var largestArea int64
-	_ = windows.EnumWindows(syscall.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
+	enumWindows(func(hwnd windows.HWND) uintptr {
 		var owner uint32
-		windows.GetWindowThreadProcessId(windows.HWND(hwnd), &owner)
-		if owner == processID && windows.IsWindowVisible(windows.HWND(hwnd)) {
+		windows.GetWindowThreadProcessId(hwnd, &owner)
+		if owner == processID && windows.IsWindowVisible(hwnd) {
 			var bounds struct{ Left, Top, Right, Bottom int32 }
-			if result, _, _ := getWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&bounds))); result != 0 {
+			if result, _, _ := getWindowRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&bounds))); result != 0 {
 				area := int64(bounds.Right-bounds.Left) * int64(bounds.Bottom-bounds.Top)
 				if area > largestArea {
-					mainWindow, largestArea = windows.HWND(hwnd), area
+					mainWindow, largestArea = hwnd, area
 				}
 			}
 		}
 		return 1
-	}), nil)
+	})
 	if mainWindow != 0 {
 		postMessage.Call(uintptr(mainWindow), 0x0010, 0, 0) // WM_CLOSE
 	}
@@ -115,36 +153,36 @@ func enforceSingleMT5Chart(processID uint32) {
 	postMessage := user32.NewProc("PostMessageW")
 	var mainWindow windows.HWND
 	var largestArea int64
-	_ = windows.EnumWindows(syscall.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
+	enumWindows(func(hwnd windows.HWND) uintptr {
 		var owner uint32
-		windows.GetWindowThreadProcessId(windows.HWND(hwnd), &owner)
-		if owner == processID && windows.IsWindowVisible(windows.HWND(hwnd)) {
+		windows.GetWindowThreadProcessId(hwnd, &owner)
+		if owner == processID && windows.IsWindowVisible(hwnd) {
 			var bounds struct{ Left, Top, Right, Bottom int32 }
-			if result, _, _ := getWindowRect.Call(hwnd, uintptr(unsafe.Pointer(&bounds))); result != 0 {
+			if result, _, _ := getWindowRect.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&bounds))); result != 0 {
 				area := int64(bounds.Right-bounds.Left) * int64(bounds.Bottom-bounds.Top)
 				if area > largestArea {
-					mainWindow = windows.HWND(hwnd)
+					mainWindow = hwnd
 					largestArea = area
 				}
 			}
 		}
 		return 1
-	}), nil)
+	})
 	if mainWindow == 0 {
 		return
 	}
 	kept := false
-	windows.EnumChildWindows(mainWindow, syscall.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
-		if !windows.IsWindowVisible(windows.HWND(hwnd)) || !isMT5ChartWindowTitle(windowText(hwnd, user32)) {
+	enumChildWindows(mainWindow, func(hwnd windows.HWND) uintptr {
+		if !windows.IsWindowVisible(hwnd) || !isMT5ChartWindowTitle(windowText(uintptr(hwnd), user32)) {
 			return 1
 		}
 		if !kept {
 			kept = true
 			return 1
 		}
-		postMessage.Call(hwnd, 0x0010, 0, 0) // WM_CLOSE
+		postMessage.Call(uintptr(hwnd), 0x0010, 0, 0) // WM_CLOSE
 		return 1
-	}), nil)
+	})
 }
 
 func windowText(hwnd uintptr, user32 *windows.LazyDLL) string {
