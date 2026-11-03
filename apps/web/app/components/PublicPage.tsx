@@ -9,7 +9,6 @@
 "use client";
 
 import { useEffect, useRef, useState } from "react";
-import { CsChatWidget } from "./CsChatWidget";
 import Mascot from "./Mascot";
 import { SiteFrame } from "./SiteFrame";
 import { apiRequest } from "../lib/api";
@@ -601,7 +600,7 @@ export default function PublicPage() {
     };
 
     /* ---------- Koneksi SSE live ---------- */
-    const performanceStream = new EventSource("/api/core/public/performance/stream");
+    const performanceStream = new EventSource("/api/public/performance/stream");
     performanceStream.addEventListener("performance", (event) => {
       try {
         renderPerformance(JSON.parse((event as MessageEvent<string>).data) as PerformanceData);
@@ -1000,7 +999,7 @@ export default function PublicPage() {
                   )}
                   <div className={`cs-chat-widget${email ? "" : " cs-chat-widget--only"}`}>
                     <button
-                      className="contact-link cs-chat-launcher"
+                      className="contact-link cs-chat-launcher cs-chat-launcher--contact"
                       id="cs-chat-open"
                       type="button"
                       onClick={() => window.dispatchEvent(new CustomEvent("algentra:cs-open"))}
@@ -1088,7 +1087,6 @@ export default function PublicPage() {
           <img className="inline-brand-icon" src="/brand-kit/icons/risk-shield.svg" alt="" />
         </p>
 
-        <CsChatWidget mode="public" />
       </main>
     </SiteFrame>
   );

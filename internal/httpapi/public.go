@@ -3,9 +3,11 @@ package httpapi
 import (
 	"bytes"
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	dbstore "github.com/rnpproject/algentra-backend/internal/database"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -14,14 +16,12 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rnpproject/algentra-backend/internal/ea/snapshot"
 )
 
 const registrationLaunch = "2027-01-16T02:00:00Z" // 09:00 Asia/Jakarta
 
-func registerPublicRoutes(mux *http.ServeMux, pool *pgxpool.Pool, contact ContactConfig, musicURL string, state *snapshot.Store, websocketOrigins []string) {
+func registerPublicRoutes(mux *http.ServeMux, pool *dbstore.Pool, contact ContactConfig, state *snapshot.Store, websocketOrigins []string) {
 	for _, prefix := range []string{"/api/public", "/v1/public"} {
 		mux.HandleFunc("GET "+prefix+"/registration-status", registrationStatus(pool))
 		mux.HandleFunc("GET "+prefix+"/contact", publicContact(contact))
@@ -29,32 +29,9 @@ func registerPublicRoutes(mux *http.ServeMux, pool *pgxpool.Pool, contact Contac
 		mux.HandleFunc("GET "+prefix+"/performance/stream", publicPerformanceStream(pool, state))
 	}
 	mux.HandleFunc("GET /ws/public/performance", publicPerformanceWebSocket(pool, state, websocketOrigins))
-	mux.HandleFunc("GET /musik.mp3", publicMusic(musicURL))
 }
 
-func publicMusic(musicURL string) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		if strings.TrimSpace(musicURL) == "" {
-			writeError(w, http.StatusNotFound, "Audio publik belum dikonfigurasi")
-			return
-		}
-		target := musicURL
-		parsed, err := url.Parse(musicURL)
-		if err == nil && strings.EqualFold(parsed.Hostname(), "github.com") {
-			segments := strings.Split(strings.Trim(parsed.Path, "/"), "/")
-			if len(segments) >= 5 && segments[2] == "blob" {
-				path := append([]string{segments[0], segments[1]}, segments[3:]...)
-				parsed = &url.URL{Scheme: "https", Host: "raw.githubusercontent.com", Path: "/" + strings.Join(path, "/"), RawQuery: parsed.RawQuery}
-			}
-		}
-		if err == nil {
-			target = parsed.String()
-		}
-		http.Redirect(w, r, target, http.StatusTemporaryRedirect)
-	}
-}
-
-func publicPerformanceStream(pool *pgxpool.Pool, state *snapshot.Store) http.HandlerFunc {
+func publicPerformanceStream(pool *dbstore.Pool, state *snapshot.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "text/event-stream")
 		w.Header().Set("Cache-Control", "public, no-store, no-transform")
@@ -110,7 +87,7 @@ type equityCandle struct {
 	ObservedAt  time.Time
 }
 
-func publicPerformance(pool *pgxpool.Pool, state *snapshot.Store) http.HandlerFunc {
+func publicPerformance(pool *dbstore.Pool, state *snapshot.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		includeCurve := true
 		if raw, exists := r.URL.Query()["include_equity_curve"]; exists {
@@ -198,7 +175,7 @@ func publicPerformance(pool *pgxpool.Pool, state *snapshot.Store) http.HandlerFu
 	}
 }
 
-func loadMasterDailyProfit(ctx context.Context, pool *pgxpool.Pool, now time.Time, currency string) ([]map[string]any, error) {
+func loadMasterDailyProfit(ctx context.Context, pool *dbstore.Pool, now time.Time, currency string) ([]map[string]any, error) {
 	zone := time.FixedZone("WIB", 7*60*60)
 	local := now.In(zone)
 	first := time.Date(local.Year(), local.Month(), local.Day(), 0, 0, 0, 0, zone).AddDate(0, 0, -6)
@@ -209,12 +186,16 @@ func loadMasterDailyProfit(ctx context.Context, pool *pgxpool.Pool, now time.Tim
 	defer rows.Close()
 	values := map[string]float64{}
 	for rows.Next() {
-		var day time.Time
+		var day string
 		var profit float64
 		if err := rows.Scan(&day, &profit); err != nil {
 			return nil, err
 		}
-		values[day.Format("2006-01-02")] = profit
+		parsedDay, err := time.Parse("2006-01-02", day)
+		if err != nil {
+			return nil, fmt.Errorf("parse tanggal profit harian master: %w", err)
+		}
+		values[parsedDay.Format("2006-01-02")] = profit
 	}
 	if err := rows.Err(); err != nil {
 		return nil, err
@@ -228,10 +209,10 @@ func loadMasterDailyProfit(ctx context.Context, pool *pgxpool.Pool, now time.Tim
 	return out, nil
 }
 
-func loadEquityCandles(ctx context.Context, pool *pgxpool.Pool, now time.Time) ([]equityCandle, any, error) {
+func loadEquityCandles(ctx context.Context, pool *dbstore.Pool, now time.Time) ([]equityCandle, any, error) {
 	var accountKey string
 	err := pool.QueryRow(ctx, `SELECT account_key FROM mt5_master_equity_candles ORDER BY observed_at DESC LIMIT 1`).Scan(&accountKey)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		return []equityCandle{}, nil, nil
 	}
 	if err != nil {
@@ -256,8 +237,17 @@ func loadEquityCandles(ctx context.Context, pool *pgxpool.Pool, now time.Time) (
 	candles := make([]equityCandle, 0)
 	for rows.Next() {
 		var candle equityCandle
-		if err := rows.Scan(&candle.MinuteStart, &candle.Open, &candle.High, &candle.Low, &candle.Close, &candle.Currency, &candle.ObservedAt); err != nil {
+		var minuteStartRaw, observedAtRaw string
+		if err := rows.Scan(&minuteStartRaw, &candle.Open, &candle.High, &candle.Low, &candle.Close, &candle.Currency, &observedAtRaw); err != nil {
 			return nil, nil, err
+		}
+		candle.MinuteStart, err = parseStoredTimestamp(minuteStartRaw)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse waktu candle equity: %w", err)
+		}
+		candle.ObservedAt, err = parseStoredTimestamp(observedAtRaw)
+		if err != nil {
+			return nil, nil, fmt.Errorf("parse waktu observasi candle equity: %w", err)
 		}
 		candles = append(candles, candle)
 	}
@@ -357,7 +347,7 @@ func optionalContact(value string) any {
 	return value
 }
 
-func registrationStatus(pool *pgxpool.Pool) http.HandlerFunc {
+func registrationStatus(pool *dbstore.Pool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		ctx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
@@ -370,10 +360,10 @@ func registrationStatus(pool *pgxpool.Pool) http.HandlerFunc {
 	}
 }
 
-func registrationIsOpen(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
+func registrationIsOpen(ctx context.Context, pool *dbstore.Pool) (bool, error) {
 	var value string
 	err := pool.QueryRow(ctx, `SELECT value FROM settings WHERE key = 'registration_open'`).Scan(&value)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		return true, nil
 	}
 	if err != nil {
@@ -383,7 +373,7 @@ func registrationIsOpen(ctx context.Context, pool *pgxpool.Pool) (bool, error) {
 	if json.Unmarshal([]byte(value), &open) != nil || !open {
 		var autoValue string
 		err = pool.QueryRow(ctx, `SELECT value FROM settings WHERE key = 'registration_auto_open'`).Scan(&autoValue)
-		if errors.Is(err, pgx.ErrNoRows) {
+		if errors.Is(err, sql.ErrNoRows) {
 			return false, nil
 		}
 		if err != nil {

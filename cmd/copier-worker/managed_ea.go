@@ -1,16 +1,87 @@
 package main
 
 import (
+	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
 )
+
+func compileCustomEA(terminalDir, sourcePath string) error {
+	metaEditor := filepath.Join(terminalDir, "metaeditor64.exe")
+	if _, err := os.Stat(metaEditor); err != nil {
+		return fmt.Errorf("MetaEditor tidak tersedia pada template MT5: %w", err)
+	}
+	outputPath := strings.TrimSuffix(sourcePath, filepath.Ext(sourcePath)) + ".ex5"
+	logPath := strings.TrimSuffix(sourcePath, filepath.Ext(sourcePath)) + ".compile.log"
+	_ = os.Remove(outputPath)
+	_ = os.Remove(logPath)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	cmd := exec.Command(metaEditor,
+		"/compile:"+sourcePath,
+		"/include:"+filepath.Join(terminalDir, "MQL5"),
+		"/log:"+logPath,
+	)
+	cmd.Dir = terminalDir
+	prepareChild(cmd)
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("MetaEditor tidak dapat dijalankan: %w", err)
+	}
+	done := make(chan struct{})
+	go func() { _ = cmd.Wait(); close(done) }()
+	// MetaEditor returns a non-zero exit code even for successful compiles and may
+	// stay open afterwards, so success is judged from the compile log and .ex5.
+	ticker := time.NewTicker(500 * time.Millisecond)
+	defer ticker.Stop()
+wait:
+	for {
+		select {
+		case <-done:
+			break wait
+		case <-ctx.Done():
+			_ = cmd.Process.Kill()
+			return errors.New("MetaEditor melewati batas waktu kompilasi 2 menit")
+		case <-ticker.C:
+			if compileLogFinished(logPath) {
+				time.Sleep(time.Second)
+				_ = cmd.Process.Kill()
+				<-done
+				break wait
+			}
+		}
+	}
+	if _, err := os.Stat(outputPath); err != nil {
+		logBytes, _ := os.ReadFile(logPath)
+		if len(logBytes) > 8192 {
+			logBytes = logBytes[len(logBytes)-8192:]
+		}
+		if len(logBytes) == 0 {
+			return errors.New("MetaEditor tidak menghasilkan file .ex5 maupun log kompilasi")
+		}
+		return fmt.Errorf("MetaEditor tidak menghasilkan file .ex5: %s", strings.TrimSpace(strings.ReplaceAll(string(logBytes), "\x00", "")))
+	}
+	return nil
+}
+
+// compileLogFinished reports whether MetaEditor wrote its final "Result:" line
+// (the log is UTF-16, so NUL bytes are stripped before matching).
+func compileLogFinished(logPath string) bool {
+	data, err := os.ReadFile(logPath)
+	if err != nil || len(data) == 0 {
+		return false
+	}
+	text := strings.ReplaceAll(string(data), "\x00", "")
+	return strings.Contains(text, "Result:")
+}
 
 func (w *worker) prepareManagedEA(j job, token, terminalDir, name string) error {
 	source := filepath.Join(w.cfg.projectRoot, "mt5", "experts", "MT5FollowerCopyEA.ex5")
@@ -30,6 +101,21 @@ func (w *worker) prepareManagedEA(j job, token, terminalDir, name string) error 
 	if err != nil {
 		return err
 	}
+	followerSymbolMap := managedSymbolMap(j.FollowerSymbol)
+	// Login probe detects and selects the account's real gold symbol. Reuse
+	// that exact instrument in the persistent copier unless the user provided
+	// an explicit follower symbol in the account settings.
+	if followerSymbolMap == "" {
+		path := filepath.Join(w.cfg.runtimeDir, "states", fmt.Sprintf("%d.gold-symbol", j.AccountID))
+		if raw, readErr := os.ReadFile(path); readErr == nil {
+			resolved := strings.TrimSpace(string(raw))
+			if resolved != "" && !strings.ContainsAny(resolved, "\r\n,=") {
+				followerSymbolMap = "XAUUSD=" + resolved
+			}
+		} else if !os.IsNotExist(readErr) {
+			return fmt.Errorf("simbol gold terpilih saat login tidak dapat dibaca: %w", readErr)
+		}
+	}
 	if err := w.feed.Register(j.AccountID, login, j.Server, token, copyAfter); err != nil {
 		return err
 	}
@@ -42,7 +128,7 @@ func (w *worker) prepareManagedEA(j job, token, terminalDir, name string) error 
 		"MaxEntryDeviationPercent=0.0||0.0||0.1||10.0||N",
 		"MaxSlippagePoints=20||20||1||100||N",
 		"SymbolSuffix=",
-		"SymbolMapCsv=XAUUSD=" + j.FollowerSymbol,
+		"SymbolMapCsv=" + followerSymbolMap,
 		"ManagedMode=true||true||false||true||N",
 		"ManagedFileBridge=true||true||false||true||N",
 		"BridgeChannel=" + strconv.FormatInt(j.AccountID, 10),
@@ -55,13 +141,23 @@ func (w *worker) prepareManagedEA(j job, token, terminalDir, name string) error 
 		fmt.Sprintf("MaxOpenPositions=%d||%d||1||1000||N", j.MaxOpenPositions, j.MaxOpenPositions),
 		"ReverseDirection=false||false||false||true||N",
 	}
-	if strings.TrimSpace(j.FollowerSymbol) == "" || strings.ContainsAny(j.FollowerSymbol, "\r\n,=") {
+	if strings.ContainsAny(j.FollowerSymbol, "\r\n,=") {
 		return fmt.Errorf("simbol follower akun %d tidak valid untuk input EA", j.AccountID)
 	}
 	if err := writeAtomic(presetPath, []byte(strings.Join(values, "\r\n")+"\r\n")); err != nil {
 		return fmt.Errorf("preset EA akun %d tidak dapat ditulis: %w", j.AccountID, err)
 	}
 	return nil
+}
+
+func managedSymbolMap(followerSymbol string) string {
+	followerSymbol = strings.TrimSpace(followerSymbol)
+	// XAUUSD was the historical UI default. Treat it as automatic so existing
+	// profiles can discover broker suffixes such as XAUUSDc/XAUUSDm themselves.
+	if followerSymbol == "" || strings.EqualFold(followerSymbol, "AUTO") || strings.EqualFold(followerSymbol, "XAUUSD") {
+		return ""
+	}
+	return "XAUUSD=" + followerSymbol
 }
 
 func (w *worker) copyAfter(accountID int64) (int64, error) {
@@ -82,14 +178,17 @@ func (w *worker) copyAfter(accountID int64) (int64, error) {
 	return value, nil
 }
 
-func writeManagedStartup(path string, j job, name, startupServer string) error {
+func writeManagedStartup(path string, j job, expertName, presetName, startupServer, startupSymbol string) error {
 	server, password := startupServer, j.BrokerPassword
-	for _, value := range []string{server, password} {
+	for _, value := range []string{server, password, expertName, presetName, startupSymbol} {
 		if strings.ContainsAny(value, "\r\n") {
 			return fmt.Errorf("kredensial terminal akun %d mengandung karakter baris baru", j.AccountID)
 		}
 	}
-	content := fmt.Sprintf("[Common]\r\nLogin=%s\r\nServer=%s\r\nPassword=%s\r\nKeepPrivate=1\r\nNewsEnable=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\nAllowDllImport=0\r\nAccount=0\r\nProfile=0\r\n\r\n[StartUp]\r\nExpert=MT5FollowerCopyEA\r\nExpertParameters=%s.set\r\nSymbol=EURUSD\r\nPeriod=M1\r\n", j.Login, server, password, name)
+	content := fmt.Sprintf("[Common]\r\nLogin=%s\r\nServer=%s\r\nPassword=%s\r\nKeepPrivate=1\r\nNewsEnable=0\r\n\r\n[Experts]\r\nEnabled=1\r\nAllowLiveTrading=1\r\nAllowDllImport=0\r\nAccount=0\r\nProfile=0\r\n\r\n[StartUp]\r\nExpert=%s\r\nSymbol=%s\r\nPeriod=M1\r\n", j.Login, server, password, expertName, startupSymbol)
+	if presetName != "" {
+		content = strings.Replace(content, "[StartUp]\r\n", "[StartUp]\r\nExpertParameters="+presetName+"\r\n", 1)
+	}
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		return fmt.Errorf("startup config MT5 akun %d tidak dapat ditulis: %w", j.AccountID, err)
 	}

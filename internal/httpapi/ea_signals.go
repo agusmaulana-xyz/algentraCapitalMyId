@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	dbstore "github.com/rnpproject/algentra-backend/internal/database"
 	"math"
 	"net/http"
 	"sort"
@@ -14,9 +15,6 @@ import (
 	"strings"
 	"time"
 	"unicode/utf8"
-
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const (
@@ -26,7 +24,7 @@ const (
 )
 
 type eaSignalAPI struct {
-	pool *pgxpool.Pool
+	pool *dbstore.Pool
 	key  string
 }
 
@@ -103,15 +101,13 @@ func (api eaSignalAPI) pending(w http.ResponseWriter, r *http.Request) {
 	}
 	defer tx.Rollback(ctx)
 	rows, err := tx.Query(ctx, `
-		WITH candidates AS (
+		UPDATE signals SET status = 'CLAIMED', claimed_at = $3
+		WHERE id IN (
 			SELECT id FROM signals
 			WHERE status = 'PENDING' OR (status = 'CLAIMED' AND (claimed_at IS NULL OR claimed_at < $1))
-			ORDER BY created_at ASC, id ASC
-			FOR UPDATE SKIP LOCKED LIMIT $2
+			ORDER BY created_at ASC, id ASC LIMIT $2
 		)
-		UPDATE signals AS s SET status = 'CLAIMED', claimed_at = $3
-		FROM candidates AS c WHERE s.id = c.id
-		RETURNING s.id, s.group_id, s.group_name, s.raw_text, s.parsed_json, s.created_at
+		RETURNING id, group_id, group_name, raw_text, parsed_json, created_at
 	`, now.Add(-eaClaimLease), limit, now)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "Sinyal tidak dapat diklaim")
@@ -268,10 +264,10 @@ func targetValues(value *[]float64) []float64 {
 	return result
 }
 
-func loadEntryMode(ctx context.Context, tx pgx.Tx) (string, error) {
+func loadEntryMode(ctx context.Context, tx *dbstore.Tx) (string, error) {
 	var value string
 	err := tx.QueryRow(ctx, `SELECT value FROM settings WHERE key = 'entry_mode'`).Scan(&value)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		return "PARTIAL", nil
 	}
 	if err != nil {
@@ -284,10 +280,10 @@ func loadEntryMode(ctx context.Context, tx pgx.Tx) (string, error) {
 	return mode, nil
 }
 
-func loadTradingControls(ctx context.Context, pool *pgxpool.Pool, now time.Time) (map[string]any, bool, error) {
+func loadTradingControls(ctx context.Context, pool *dbstore.Pool, now time.Time) (map[string]any, bool, error) {
 	var killRaw, deviationRaw string
 	err := pool.QueryRow(ctx, `SELECT value FROM settings WHERE key = 'kill_switch'`).Scan(&killRaw)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, false, err
 	}
 	var kill bool
@@ -295,7 +291,7 @@ func loadTradingControls(ctx context.Context, pool *pgxpool.Pool, now time.Time)
 		_ = json.Unmarshal([]byte(killRaw), &kill)
 	}
 	err = pool.QueryRow(ctx, `SELECT value FROM settings WHERE key = 'max_market_deviation_pct'`).Scan(&deviationRaw)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, false, err
 	}
 	deviation := 5.0
@@ -324,7 +320,7 @@ func loadTradingControls(ctx context.Context, pool *pgxpool.Pool, now time.Time)
 	return controls, kill, nil
 }
 
-func insertSystemLog(ctx context.Context, tx pgx.Tx, now time.Time, level, source, message string) error {
+func insertSystemLog(ctx context.Context, tx *dbstore.Tx, now time.Time, level, source, message string) error {
 	_, err := tx.Exec(ctx, `INSERT INTO logs (level, source, message, created_at) VALUES ($1,$2,$3,$4)`, level, source, message, now)
 	return err
 }
@@ -381,7 +377,7 @@ func (api eaSignalAPI) report(w http.ResponseWriter, r *http.Request) {
 	var status string
 	var parsedRaw sql.NullString
 	err = tx.QueryRow(ctx, `SELECT status, parsed_json FROM signals WHERE id = $1 FOR UPDATE`, payload.SignalID).Scan(&status, &parsedRaw)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusNotFound, "Signal tidak ditemukan")
 		return
 	}
@@ -408,7 +404,7 @@ func (api eaSignalAPI) report(w http.ResponseWriter, r *http.Request) {
 	var executionTicket sql.NullString
 	err = tx.QueryRow(ctx, `SELECT id, status, ticket FROM ea_executions WHERE signal_id = $1 AND leg = $2 FOR UPDATE`, payload.SignalID, leg).Scan(&executionID, &executionStatus, &executionTicket)
 	executionExists := err == nil
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		writeError(w, http.StatusServiceUnavailable, "Laporan eksekusi tidak dapat dibaca")
 		return
 	}
@@ -436,7 +432,7 @@ func (api eaSignalAPI) report(w http.ResponseWriter, r *http.Request) {
 		var tradeSignal sql.NullInt64
 		err = tx.QueryRow(ctx, `SELECT id, signal_id FROM trades WHERE ticket = $1 FOR UPDATE`, *ticket).Scan(&tradeID, &tradeSignal)
 		tradeExists := err == nil
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			writeError(w, http.StatusServiceUnavailable, "Ticket trade tidak dapat diperiksa")
 			return
 		}
@@ -538,7 +534,7 @@ func validExecutionReport(p executionReportRequest) bool {
 	return err == nil
 }
 
-func upsertExecution(ctx context.Context, tx pgx.Tx, exists bool, id, signalID int64, leg int, p executionReportRequest, ticket *string, now time.Time) error {
+func upsertExecution(ctx context.Context, tx *dbstore.Tx, exists bool, id, signalID int64, leg int, p executionReportRequest, ticket *string, now time.Time) error {
 	if exists {
 		_, err := tx.Exec(ctx, `UPDATE ea_executions SET status=$2, ticket=$3, lots=$4, exec_price=$5, reason=$6 WHERE id=$1`, id, p.Status, ticket, p.Lots, p.ExecPrice, p.Reason)
 		return err
@@ -590,7 +586,7 @@ func expectedSignalLegs(parsed map[string]any) int {
 	return 1
 }
 
-func syncSignalExecutionStatus(ctx context.Context, tx pgx.Tx, signalID int64, expectedLegs int) error {
+func syncSignalExecutionStatus(ctx context.Context, tx *dbstore.Tx, signalID int64, expectedLegs int) error {
 	rows, err := tx.Query(ctx, `SELECT leg,status FROM ea_executions WHERE signal_id = $1`, signalID)
 	if err != nil {
 		return err
@@ -641,7 +637,7 @@ func syncSignalExecutionStatus(ctx context.Context, tx pgx.Tx, signalID int64, e
 	if err == nil {
 		return setSignalStatus(ctx, tx, signalID, "EXECUTED")
 	}
-	if !errors.Is(err, pgx.ErrNoRows) {
+	if !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
 	rows, err = tx.Query(ctx, `SELECT result,profit FROM trades WHERE signal_id=$1`, signalID)
@@ -683,7 +679,7 @@ func syncSignalExecutionStatus(ctx context.Context, tx pgx.Tx, signalID int64, e
 	return setSignalStatus(ctx, tx, signalID, status)
 }
 
-func setSignalStatus(ctx context.Context, tx pgx.Tx, signalID int64, status string) error {
+func setSignalStatus(ctx context.Context, tx *dbstore.Tx, signalID int64, status string) error {
 	_, err := tx.Exec(ctx, `UPDATE signals SET status=$2 WHERE id=$1`, signalID, status)
 	return err
 }

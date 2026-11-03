@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	dbstore "github.com/rnpproject/algentra-backend/internal/database"
 	"math"
 	"net/http"
 	"os"
@@ -13,12 +14,10 @@ import (
 	"strings"
 	"time"
 	"unicode"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 type parserAPI struct {
-	pool          *pgxpool.Pool
+	pool          *dbstore.Pool
 	key, model    string
 	timeout       time.Duration
 	retries       int
@@ -163,7 +162,7 @@ type parserSettings struct {
 	mapping      map[string]string
 }
 
-func readParserSettings(ctx context.Context, pool *pgxpool.Pool) parserSettings {
+func readParserSettings(ctx context.Context, pool *dbstore.Pool) parserSettings {
 	s := parserSettings{threshold: .75, mapping: map[string]string{"XAUUSD": "XAUUSD", "GOLD": "XAUUSD", "XAU": "XAUUSD", "EMAS": "XAUUSD"}}
 	rows, err := pool.Query(ctx, `SELECT key,value FROM settings WHERE key IN ('confidence_threshold','allow_updates','symbol_mapping')`)
 	if err != nil {

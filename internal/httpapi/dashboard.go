@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	dbstore "github.com/rnpproject/algentra-backend/internal/database"
 	"math"
 	"net/http"
 	"net/http/httptest"
@@ -15,14 +16,12 @@ import (
 	"time"
 
 	"database/sql"
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rnpproject/algentra-backend/internal/ea/snapshot"
 	telegramclient "github.com/rnpproject/algentra-backend/internal/telegram"
 )
 
 type dashboardAPI struct {
-	pool            *pgxpool.Pool
+	pool            *dbstore.Pool
 	state           *snapshot.Store
 	telegram        *telegramclient.Manager
 	geminiKey       string
@@ -31,7 +30,7 @@ type dashboardAPI struct {
 }
 
 func (api dashboardAPI) register(mux *http.ServeMux) {
-	for _, prefix := range []string{"/api", "/v1/dashboard"} {
+	for _, prefix := range []string{"/api", "/api/dashboard", "/v1/dashboard"} {
 		mux.HandleFunc("GET "+prefix+"/stats", api.stats)
 		mux.HandleFunc("GET "+prefix+"/realtime/stream", api.realtimeStream)
 		mux.HandleFunc("GET "+prefix+"/mt5-live", api.mt5Live)
@@ -88,7 +87,7 @@ func (api dashboardAPI) writeDashboardEvent(w http.ResponseWriter, r *http.Reque
 	defer cancel()
 	var latest sql.NullInt64
 	err := api.pool.QueryRow(ctx, `SELECT id FROM signals ORDER BY created_at DESC,id DESC LIMIT 1`).Scan(&latest)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return err
 	}
 	var latestID any
@@ -145,7 +144,8 @@ func (api dashboardAPI) stats(w http.ResponseWriter, r *http.Request) {
 	var wins, losses int64
 	var profit, dailyLoss float64
 	var activeClients int64
-	if err := api.pool.QueryRow(ctx, `SELECT count(*) FILTER(WHERE upper(COALESCE(result,''))='WIN'),count(*) FILTER(WHERE upper(COALESCE(result,''))='LOSS'),COALESCE(sum(profit),0),COALESCE(sum(GREATEST(0,-profit)) FILTER(WHERE closed_at >= $1),0) FROM trades`, wibDayStart(time.Now().UTC())).Scan(&wins, &losses, &profit, &dailyLoss); err != nil {
+	var closedTrades int64
+	if err := api.pool.QueryRow(ctx, `SELECT count(*) FILTER(WHERE closed_at IS NOT NULL AND upper(COALESCE(result,''))='WIN'),count(*) FILTER(WHERE closed_at IS NOT NULL AND upper(COALESCE(result,''))='LOSS'),COALESCE(sum(profit) FILTER(WHERE closed_at IS NOT NULL),0),COALESCE(sum(GREATEST(0,-profit)) FILTER(WHERE closed_at >= $1),0),count(*) FILTER(WHERE closed_at IS NOT NULL) FROM trades`, wibDayStart(time.Now().UTC())).Scan(&wins, &losses, &profit, &dailyLoss, &closedTrades); err != nil {
 		writeError(w, 503, "Statistik trade tidak tersedia")
 		return
 	}
@@ -169,7 +169,7 @@ func (api dashboardAPI) stats(w http.ResponseWriter, r *http.Request) {
 	if hasHeartbeat {
 		last = wibTime(heartbeat.LastHeartbeat)
 	}
-	payload := map[string]any{"signals_total": total, "signals_executed": statuses["EXECUTED"] + statuses["WIN"] + statuses["LOSS"] + statuses["BE"], "signals_pending": statuses["PENDING"] + statuses["CLAIMED"], "signals_processing": statuses["PROCESSING"], "signals_rejected": statuses["REJECTED"] + statuses["FAILED"], "signals_ignored": statuses["IGNORED"], "signals_expired": statuses["EXPIRED"], "signal_status_unknown": len(unknown) > 0, "signal_status_unknown_values": unknown, "active_clients": activeClients, "ea_online": eaOnline, "ea_last_heartbeat": last, "daily_loss": math.Round(dailyLoss*100) / 100, "wins": wins, "losses": losses, "winrate": winrate, "total_profit": math.Round(profit*100) / 100}
+	payload := map[string]any{"signals_total": total, "signals_executed": statuses["EXECUTED"] + statuses["WIN"] + statuses["LOSS"] + statuses["BE"], "signals_pending": statuses["PENDING"] + statuses["CLAIMED"], "signals_processing": statuses["PROCESSING"], "signals_rejected": statuses["REJECTED"] + statuses["FAILED"], "signals_ignored": statuses["IGNORED"], "signals_expired": statuses["EXPIRED"], "signal_status_unknown": len(unknown) > 0, "signal_status_unknown_values": unknown, "active_clients": activeClients, "ea_online": eaOnline, "ea_last_heartbeat": last, "daily_loss": math.Round(dailyLoss*100) / 100, "trades_closed": closedTrades, "wins": wins, "losses": losses, "winrate": winrate, "total_profit": math.Round(profit*100) / 100}
 	for key, value := range controls {
 		if key == "daily_profit" || key == "daily_loss" || key == "open_trades" || key == "kill_switch" || key == "max_market_deviation_pct" || key == "trading_paused" {
 			payload[key] = value
@@ -258,7 +258,7 @@ func (api dashboardAPI) signals(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
-	rows, err := api.pool.Query(ctx, `SELECT s.id,s.group_id,s.group_name,s.message_id,s.sender_id,s.sender_name,s.raw_text,s.parsed_json,s.normalized_text,s.confidence,s.status,s.created_at,t.ticket,t.profit FROM signals s LEFT JOIN trades t ON t.signal_id=s.id WHERE ($1='' OR s.status=$1) AND ($2='' OR s.group_id=$2) ORDER BY s.created_at DESC,s.id DESC OFFSET $3 LIMIT $4`, strings.ToUpper(r.URL.Query().Get("status")), r.URL.Query().Get("group_id"), offset, limit)
+	rows, err := api.pool.Query(ctx, `SELECT s.id,s.group_id,s.group_name,s.message_id,s.sender_id,s.sender_name,s.raw_text,s.parsed_json,s.normalized_text,s.confidence,s.status,s.created_at,t.ticket,CASE WHEN t.closed_at IS NOT NULL THEN t.profit ELSE NULL END FROM signals s LEFT JOIN trades t ON t.signal_id=s.id WHERE ($1='' OR s.status=$1) AND ($2='' OR s.group_id=$2) ORDER BY s.created_at DESC,s.id DESC OFFSET $3 LIMIT $4`, strings.ToUpper(r.URL.Query().Get("status")), r.URL.Query().Get("group_id"), offset, limit)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "Signal tidak tersedia")
 		return
@@ -396,7 +396,7 @@ func (api dashboardAPI) loadTrades(r *http.Request, limit, offset int) ([]map[st
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
-	rows, err := api.pool.Query(ctx, `SELECT t.id,t.signal_id,t.ticket,s.group_id,s.group_name,t.symbol,t.action,t.lots,t.entry,t.sl,t.tp,t.exec_price,t.profit,t.result,t.opened_at,t.closed_at FROM trades t LEFT JOIN signals s ON s.id=t.signal_id WHERE ($1::timestamptz IS NULL OR t.opened_at >= $1) AND ($2::timestamptz IS NULL OR t.opened_at <= $2) AND ($3='' OR s.group_id=$3) AND ($4='' OR t.symbol=$4) AND ($5='' OR t.result=$5) ORDER BY t.opened_at DESC,t.id DESC OFFSET $6 LIMIT $7`, from, to, r.URL.Query().Get("group_id"), strings.ToUpper(r.URL.Query().Get("symbol")), strings.ToUpper(r.URL.Query().Get("result")), offset, limit)
+	rows, err := api.pool.Query(ctx, `SELECT t.id,t.signal_id,t.ticket,s.group_id,s.group_name,t.symbol,t.action,t.lots,t.entry,t.sl,t.tp,t.exec_price,CASE WHEN t.closed_at IS NOT NULL THEN t.profit ELSE NULL END,t.result,t.opened_at,t.closed_at FROM trades t LEFT JOIN signals s ON s.id=t.signal_id WHERE ($1::timestamptz IS NULL OR t.opened_at >= $1) AND ($2::timestamptz IS NULL OR t.opened_at <= $2) AND ($3='' OR s.group_id=$3) AND ($4='' OR t.symbol=$4) AND ($5='' OR t.result=$5) ORDER BY t.opened_at DESC,t.id DESC OFFSET $6 LIMIT $7`, from, to, r.URL.Query().Get("group_id"), strings.ToUpper(r.URL.Query().Get("symbol")), strings.ToUpper(r.URL.Query().Get("result")), offset, limit)
 	if err != nil {
 		return nil, err
 	}
@@ -409,11 +409,18 @@ func (api dashboardAPI) loadTrades(r *http.Request, limit, offset int) ([]map[st
 		var lots, entry, sl, execPrice, profit *float64
 		var tp *string
 		var result *string
-		var opened, closed *time.Time
+		var opened, closed sql.NullTime
 		if err := rows.Scan(&id, &signalID, &ticket, &groupID, &groupName, &symbol, &action, &lots, &entry, &sl, &tp, &execPrice, &profit, &result, &opened, &closed); err != nil {
 			return nil, err
 		}
-		items = append(items, map[string]any{"id": id, "signal_id": signalID, "ticket": ticket, "group_id": groupID, "group_name": groupName, "symbol": symbol, "action": action, "lots": lots, "entry": entry, "sl": sl, "tp": tp, "exec_price": execPrice, "profit": profit, "result": result, "opened_at": wibNullableTime(opened), "closed_at": wibNullableTime(closed)})
+		var openedAt, closedAt any
+		if opened.Valid {
+			openedAt = wibTime(opened.Time)
+		}
+		if closed.Valid {
+			closedAt = wibTime(closed.Time)
+		}
+		items = append(items, map[string]any{"id": id, "signal_id": signalID, "ticket": ticket, "group_id": groupID, "group_name": groupName, "symbol": symbol, "action": action, "lots": lots, "entry": entry, "sl": sl, "tp": tp, "exec_price": execPrice, "profit": profit, "result": result, "opened_at": openedAt, "closed_at": closedAt})
 	}
 	return items, rows.Err()
 }
@@ -450,7 +457,7 @@ func (api dashboardAPI) groupStats(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
-	rows, err := api.pool.Query(ctx, `SELECT s.group_id,s.group_name,count(DISTINCT s.id),count(t.id) FILTER(WHERE upper(COALESCE(t.result,''))='WIN'),count(t.id) FILTER(WHERE upper(COALESCE(t.result,''))='LOSS'),COALESCE(sum(t.profit),0) FROM signals s LEFT JOIN trades t ON t.signal_id=s.id GROUP BY s.group_id,s.group_name ORDER BY count(DISTINCT s.id) DESC`)
+	rows, err := api.pool.Query(ctx, `SELECT s.group_id,s.group_name,count(DISTINCT s.id),count(t.id) FILTER(WHERE t.closed_at IS NOT NULL AND upper(COALESCE(t.result,''))='WIN'),count(t.id) FILTER(WHERE t.closed_at IS NOT NULL AND upper(COALESCE(t.result,''))='LOSS'),COALESCE(sum(t.profit) FILTER(WHERE t.closed_at IS NOT NULL),0),count(t.id) FILTER(WHERE t.closed_at IS NOT NULL) FROM signals s LEFT JOIN trades t ON t.signal_id=s.id GROUP BY s.group_id,s.group_name ORDER BY count(DISTINCT s.id) DESC`)
 	if err != nil {
 		writeError(w, 503, "Statistik grup tidak tersedia")
 		return
@@ -459,9 +466,9 @@ func (api dashboardAPI) groupStats(w http.ResponseWriter, r *http.Request) {
 	out := make([]map[string]any, 0)
 	for rows.Next() {
 		var id, name *string
-		var total, wins, losses int64
+		var total, wins, losses, closedTrades int64
 		var profit float64
-		if err := rows.Scan(&id, &name, &total, &wins, &losses, &profit); err != nil {
+		if err := rows.Scan(&id, &name, &total, &wins, &losses, &profit, &closedTrades); err != nil {
 			writeError(w, 503, "Statistik grup tidak tersedia")
 			return
 		}
@@ -473,7 +480,7 @@ func (api dashboardAPI) groupStats(w http.ResponseWriter, r *http.Request) {
 		if name != nil && *name != "" {
 			label = *name
 		}
-		out = append(out, map[string]any{"group_id": id, "group_name": label, "signals_total": total, "wins": wins, "losses": losses, "winrate": mathRound(rate), "profit": mathRound(profit)})
+		out = append(out, map[string]any{"group_id": id, "group_name": label, "signals_total": total, "trades_closed": closedTrades, "wins": wins, "losses": losses, "winrate": mathRound(rate), "profit": mathRound(profit)})
 	}
 	if err := rows.Err(); err != nil {
 		writeError(w, 503, "Statistik grup tidak tersedia")

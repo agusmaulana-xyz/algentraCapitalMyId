@@ -7,18 +7,18 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
+	dbstore "github.com/rnpproject/algentra-backend/internal/database"
 	"net"
 	"net/http"
 	"strconv"
+	"strings"
 	"time"
-
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const (
@@ -41,7 +41,7 @@ type sessionState struct {
 
 type sessionContextKey struct{}
 
-func SessionMiddleware(pool *pgxpool.Pool, appSecret string, secure bool, next http.Handler) http.Handler {
+func SessionMiddleware(pool *dbstore.Pool, appSecret string, secure bool, next http.Handler) http.Handler {
 	adminName, clientName := adminCookieName, clientCookieName
 	if secure {
 		adminName, clientName = hostAdminCookieName, hostClientCookieName
@@ -82,20 +82,32 @@ func SessionMiddleware(pool *pgxpool.Pool, appSecret string, secure bool, next h
 	})
 }
 
-func loadSession(ctx context.Context, pool *pgxpool.Pool, appSecret, userType, token string) (*sessionState, bool, error) {
+func loadSession(ctx context.Context, pool *dbstore.Pool, appSecret, userType, token string) (*sessionState, bool, error) {
 	hash := sessionHash(appSecret, token)
 	var storedType, userID, data string
-	var expiresAt time.Time
-	var revokedAt *time.Time
+	var expiresAtRaw string
+	var revokedAtRaw sql.NullString
 	err := pool.QueryRow(ctx, `
 		SELECT user_type, user_id, session_data, expires_at, revoked_at
 		FROM auth_sessions WHERE session_hash = $1
-	`, hash).Scan(&storedType, &userID, &data, &expiresAt, &revokedAt)
-	if errors.Is(err, pgx.ErrNoRows) {
+	`, hash).Scan(&storedType, &userID, &data, &expiresAtRaw, &revokedAtRaw)
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, false, nil
 	}
 	if err != nil {
 		return nil, false, err
+	}
+	expiresAt, err := parseStoredTimestamp(expiresAtRaw)
+	if err != nil {
+		return nil, false, fmt.Errorf("parse waktu kedaluwarsa sesi: %w", err)
+	}
+	var revokedAt *time.Time
+	if revokedAtRaw.Valid {
+		parsed, err := parseStoredTimestamp(revokedAtRaw.String)
+		if err != nil {
+			return nil, false, fmt.Errorf("parse waktu pencabutan sesi: %w", err)
+		}
+		revokedAt = &parsed
 	}
 	now := time.Now().UTC()
 	if revokedAt != nil || !expiresAt.After(now) || storedType != userType {
@@ -127,7 +139,25 @@ func loadSession(ctx context.Context, pool *pgxpool.Pool, appSecret, userType, t
 	return &sessionState{Values: values, loadedHash: hash, originalJSON: string(canonical)}, true, nil
 }
 
-func persistSession(ctx context.Context, w http.ResponseWriter, pool *pgxpool.Pool, appSecret string, secure bool, state *sessionState) error {
+func parseStoredTimestamp(value string) (time.Time, error) {
+	value = strings.TrimSpace(value)
+	for _, layout := range []string{
+		time.RFC3339Nano,
+		"2006-01-02 15:04:05.999999999 -0700 MST",
+		"2006-01-02 15:04:05 -0700 MST",
+		"2006-01-02 15:04:05.999999999-07:00",
+		"2006-01-02 15:04:05.999999999",
+		"2006-01-02 15:04:05-07:00",
+		"2006-01-02 15:04:05",
+	} {
+		if parsed, err := time.Parse(layout, value); err == nil {
+			return parsed, nil
+		}
+	}
+	return time.Time{}, fmt.Errorf("format timestamp tidak dikenal: %q", value)
+}
+
+func persistSession(ctx context.Context, w http.ResponseWriter, pool *dbstore.Pool, appSecret string, secure bool, state *sessionState) error {
 	for _, name := range state.expiredCookies {
 		setExpiredCookie(w, name, secure)
 	}

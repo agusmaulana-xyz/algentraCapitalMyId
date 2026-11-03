@@ -6,31 +6,20 @@ func TestValidateDevelopmentSecrets(t *testing.T) {
 	s := Settings{
 		AppEnv: "development", AppSecretKey: "a-random-secret-that-is-long-enough-to-use",
 		AdminUsername: "admin", AdminPassword: "a-unique-password-long-enough",
+		DatabaseFile: "./data/database.sqlite",
 	}
 	if err := s.Validate(); err != nil {
 		t.Fatalf("valid development config rejected: %v", err)
 	}
 }
 
-func TestValidateRejectsUnsafeDatabaseRoleAndTLS(t *testing.T) {
+func TestValidateRequiresDatabaseFile(t *testing.T) {
 	base := Settings{
 		AppEnv: "development", AppSecretKey: "a-random-secret-that-is-long-enough-to-use",
 		AdminUsername: "admin", AdminPassword: "a-unique-password-long-enough",
-		SupabaseDevRef: "projectref",
 	}
-	tests := []struct{ name, databaseURL string }{
-		{name: "owner role", databaseURL: "postgresql://postgres:password@db.projectref.supabase.co/postgres?sslmode=require"},
-		{name: "tls disabled", databaseURL: "postgresql://algentra_api:password@db.projectref.supabase.co/postgres?sslmode=disable"},
-		{name: "wrong project", databaseURL: "postgresql://algentra_api:password@db.otherref.supabase.co/postgres?sslmode=require"},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			s := base
-			s.DatabaseURL = tt.databaseURL
-			if err := s.Validate(); err == nil {
-				t.Fatal("expected unsafe database configuration to be rejected")
-			}
-		})
+	if err := base.Validate(); err == nil {
+		t.Fatal("expected missing DATABASE_FILE to be rejected")
 	}
 }
 

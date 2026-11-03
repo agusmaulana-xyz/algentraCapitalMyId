@@ -1,5 +1,5 @@
 /**
- * Klien API browser -> BFF (/api/core/*).
+ * Klien API browser -> Core API (/api/*).
  *
  * Perbaikan dibanding versi lama:
  *  - timeout per request (sebelumnya bisa menggantung selamanya -> UI "loading" terus);
@@ -157,7 +157,7 @@ export async function apiRequest<T>(path: string, init: RequestInit = {}): Promi
     const csrf = currentCsrf();
     if (csrf) headers.set("x-csrf-token", csrf);
   }
-  const url = `/api/core/${path}`;
+  const url = `/api/${path}`;
   const requestInit: RequestInit = { ...init, method, headers, cache: "no-store" };
 
   // Perubahan data -> buang cache agar bacaan berikutnya selalu segar.
@@ -198,7 +198,7 @@ export async function apiUpload<T>(path: string, form: FormData): Promise<T> {
   const stopLoading = beginActionButtonLoading();
   reportApiActivity("start");
   try {
-    return await execute<T>(`/api/core/${path}`, { method: "POST", headers, body: form, cache: "no-store" }, "POST", UPLOAD_TIMEOUT_MS);
+    return await execute<T>(`/api/${path}`, { method: "POST", headers, body: form, cache: "no-store" }, "POST", UPLOAD_TIMEOUT_MS);
   } finally {
     stopLoading();
     reportApiActivity("end");

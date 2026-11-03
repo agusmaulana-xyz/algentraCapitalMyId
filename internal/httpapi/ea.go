@@ -3,17 +3,17 @@ package httpapi
 import (
 	"context"
 	"crypto/subtle"
+	dbstore "github.com/rnpproject/algentra-backend/internal/database"
 	"net/http"
 	"regexp"
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/rnpproject/algentra-backend/internal/ea/snapshot"
 )
 
 type eaSnapshotAPI struct {
-	pool  *pgxpool.Pool
+	pool  *dbstore.Pool
 	key   string
 	state *snapshot.Store
 }

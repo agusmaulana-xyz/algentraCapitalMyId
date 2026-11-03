@@ -29,6 +29,17 @@ func isTerminalFileBusy(err error) bool {
 	return code == syscall.Errno(32) || code == syscall.Errno(33)
 }
 
+// clearSavedCharts removes charts MT5 restored from the saved profile. Each
+// launch with a startup Symbol adds a chart to that profile, so stale ones
+// (often for symbols the broker does not offer) pile up as extra windows.
+func clearSavedCharts(terminalDir string) {
+	dir := filepath.Join(terminalDir, "MQL5", "Profiles", "Charts", "Default")
+	files, _ := filepath.Glob(filepath.Join(dir, "*.chr"))
+	for _, f := range files {
+		_ = os.Remove(f)
+	}
+}
+
 func enableAutoTrading(terminalDir string) error {
 	path := filepath.Join(terminalDir, "Config", "common.ini")
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {

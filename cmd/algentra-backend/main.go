@@ -24,16 +24,12 @@ func main() {
 		slog.Error("konfigurasi service tidak valid", "error", err)
 		os.Exit(1)
 	}
-	if settings.DatabaseURL == "" {
-		slog.Error("DATABASE_URL wajib diisi untuk Core API Go")
+	if settings.DatabaseFile == "" {
+		slog.Error("DATABASE_FILE wajib diisi untuk Core API Go")
 		os.Exit(1)
 	}
-	projectRef := settings.SupabaseProjectRef
-	if settings.AppEnv == "development" {
-		projectRef = settings.SupabaseDevRef
-	}
 	startupCtx, startupCancel := context.WithTimeout(context.Background(), 15*time.Second)
-	pool, err := database.Open(startupCtx, settings.DatabaseURL)
+	pool, err := database.Open(startupCtx, settings.DatabaseFile)
 	startupCancel()
 	if err != nil {
 		slog.Error("gagal menyiapkan koneksi database")
@@ -41,7 +37,7 @@ func main() {
 	}
 	defer pool.Close()
 	readyCtx, readyCancel := context.WithTimeout(context.Background(), 30*time.Second)
-	err = database.CheckReady(readyCtx, pool, settings.AppEnv, projectRef)
+	err = database.CheckReady(readyCtx, pool, "", "")
 	readyCancel()
 	if err != nil {
 		slog.Error("database belum siap atau schema tidak sesuai", "error", err)
@@ -75,46 +71,36 @@ func main() {
 	if projectRoot == "" {
 		projectRoot, _ = os.Getwd()
 	}
-	tgManager := telegramclient.NewManager(settings.TelegramAPIID, settings.TelegramAPIHash, filepath.Join(projectRoot, "backend", "data", "telegram_user.gotd.session"))
+	tgManager := telegramclient.NewManager(settings.TelegramAPIID, settings.TelegramAPIHash, filepath.Join(projectRoot, "data", "telegram_user.gotd.session"))
 	handler := httpapi.NewHandler(pool, httpapi.ServerConfig{
-		Environment:             settings.AppEnv,
-		ProjectRef:              projectRef,
-		BFFSecret:               settings.BFFHMACSecret,
-		ServiceName:             "algentra-capital",
-		CookieSecure:            settings.CookieSecure,
-		WebSocketOrigins:        settings.WebSocketOrigins,
-		TelegramManager:         tgManager,
-		AppSecretKey:            settings.AppSecretKey,
-		WorkerAPIKey:            settings.CopierWorkerAPIKey,
-		EAAPIKey:                settings.EAAPIKey,
-		PublicMusicURL:          settings.PublicMusicURL,
-		GeminiAPIKey:            settings.GeminiAPIKey,
-		GeminiModel:             settings.GeminiModel,
-		GeminiTimeoutSeconds:    settings.GeminiTimeoutSeconds,
-		GeminiRetryAttempts:     settings.GeminiRetryAttempts,
-		EnableRegexFallback:     settings.EnableRegexFallback,
-		GeminiCSAPIKey:          settings.GeminiCSAPIKey,
-		GeminiCSModel:           settings.GeminiCSModel,
-		GeminiCSTimeoutSeconds:  settings.GeminiCSTimeoutSeconds,
-		PaymentBankName:         settings.PaymentBankName,
-		PaymentNumber:           settings.PaymentNumber,
-		PaymentName:             settings.PaymentName,
-		MidtransConfigured:      settings.MidtransConfigured,
-		MidtransServerKey:       settings.MidtransServerKey,
-		MidtransMerchantID:      settings.MidtransMerchantID,
-		MidtransProduction:      settings.MidtransProduction,
-		MidtransNotificationURL: settings.MidtransNotificationURL,
-		TelegramBotToken:        settings.TelegramBotToken,
-		TelegramAdminChatID:     settings.TelegramAdminChatID,
-		BotContext:              ctx,
-		EmailConfigured:         settings.EmailConfigured,
-		EmailSMTPHost:           settings.EmailSMTPHost,
-		EmailSMTPPort:           settings.EmailSMTPPort,
-		EmailSMTPUsername:       settings.EmailSMTPUsername,
-		EmailSMTPPassword:       settings.EmailSMTPPassword,
-		EmailFrom:               settings.EmailFrom,
-		EmailSMTPStartTLS:       settings.EmailSMTPStartTLS,
-		ProjectRoot:             os.Getenv("PROJECT_ROOT"),
+		Environment:           settings.AppEnv,
+		MT5BrokerDirectoryURL: settings.MT5BrokerDirectoryURL,
+		ServiceName:           "algentra-capital",
+		CookieSecure:          settings.CookieSecure,
+		WebSocketOrigins:      settings.WebSocketOrigins,
+		TelegramManager:       tgManager,
+		AppSecretKey:          settings.AppSecretKey,
+		WorkerAPIKey:          settings.CopierWorkerAPIKey,
+		EAAPIKey:              settings.EAAPIKey,
+		GeminiAPIKey:          settings.GeminiAPIKey,
+		GeminiModel:           settings.GeminiModel,
+		PaymentBankName:       settings.PaymentBankName,
+		PaymentNumber:         settings.PaymentNumber,
+		PaymentName:           settings.PaymentName,
+		AirPayConfigured:      settings.AirPayConfigured,
+		AirPayAPIKey:          settings.AirPayAPIKey,
+		AirPayMerchantUID:     settings.AirPayMerchantUID,
+		TelegramBotToken:      settings.TelegramBotToken,
+		TelegramAdminChatID:   settings.TelegramAdminChatID,
+		BotContext:            ctx,
+		EmailConfigured:       settings.EmailConfigured,
+		EmailSMTPHost:         settings.EmailSMTPHost,
+		EmailSMTPPort:         settings.EmailSMTPPort,
+		EmailSMTPUsername:     settings.EmailSMTPUsername,
+		EmailSMTPPassword:     settings.EmailSMTPPassword,
+		EmailFrom:             settings.EmailFrom,
+		EmailSMTPStartTLS:     settings.EmailSMTPStartTLS,
+		ProjectRoot:           os.Getenv("PROJECT_ROOT"),
 		Contact: httpapi.ContactConfig{
 			PersonName:    settings.ContactPersonName,
 			WhatsApp:      settings.ContactWhatsApp,

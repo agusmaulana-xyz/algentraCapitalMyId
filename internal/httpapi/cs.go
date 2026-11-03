@@ -5,11 +5,13 @@ import (
 	"crypto/hmac"
 	"crypto/rand"
 	"crypto/sha256"
+	"database/sql"
 	_ "embed"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
+	dbstore "github.com/rnpproject/algentra-backend/internal/database"
 	"io"
 	"log/slog"
 	"net/http"
@@ -18,9 +20,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 const csLifetime = 24 * time.Hour
@@ -48,7 +47,7 @@ var csSecretLike = regexp.MustCompile(`[A-Za-z0-9_-]{32,}`)
 var csKnowledgeBase string
 
 type customerServiceAPI struct {
-	pool         *pgxpool.Pool
+	pool         *dbstore.Pool
 	ctx          context.Context
 	secret       string
 	cookieSecure bool
@@ -255,12 +254,19 @@ func (api customerServiceAPI) findConversation(ctx context.Context, id csIdentit
 		arg = *id.visitorHash
 	}
 	var cid int64
-	var exp time.Time
-	err := api.pool.QueryRow(ctx, query, arg, now).Scan(&cid, &exp)
-	if errors.Is(err, pgx.ErrNoRows) {
+	var expiresRaw string
+	err := api.pool.QueryRow(ctx, query, arg, now).Scan(&cid, &expiresRaw)
+	if errors.Is(err, sql.ErrNoRows) {
 		return 0, time.Time{}, false, nil
 	}
-	return cid, exp, err == nil, err
+	if err != nil {
+		return 0, time.Time{}, false, err
+	}
+	expires, err := parseStoredTimestamp(expiresRaw)
+	if err != nil {
+		return 0, time.Time{}, false, err
+	}
+	return cid, expires, true, nil
 }
 
 func checkCSOrigin(r *http.Request) bool {
@@ -319,14 +325,15 @@ func (api customerServiceAPI) message(w http.ResponseWriter, r *http.Request) {
 	}
 	if !found {
 		if identity.clientID != nil {
-			err = api.pool.QueryRow(ctx, `INSERT INTO cs_conversations(client_user_id,public_visitor_hash,started_at,expires_at) VALUES($1,NULL,$2,$3) RETURNING id,expires_at`, *identity.clientID, now, now.Add(csLifetime)).Scan(&cid, &expires)
+			err = api.pool.QueryRow(ctx, `INSERT INTO cs_conversations(client_user_id,public_visitor_hash,started_at,expires_at) VALUES($1,NULL,$2,$3) RETURNING id`, *identity.clientID, now, now.Add(csLifetime)).Scan(&cid)
 		} else {
-			err = api.pool.QueryRow(ctx, `INSERT INTO cs_conversations(client_user_id,public_visitor_hash,started_at,expires_at) VALUES(NULL,$1,$2,$3) RETURNING id,expires_at`, *identity.visitorHash, now, now.Add(csLifetime)).Scan(&cid, &expires)
+			err = api.pool.QueryRow(ctx, `INSERT INTO cs_conversations(client_user_id,public_visitor_hash,started_at,expires_at) VALUES(NULL,$1,$2,$3) RETURNING id`, *identity.visitorHash, now, now.Add(csLifetime)).Scan(&cid)
 		}
 		if err != nil {
 			writeError(w, 503, "Chat tidak tersedia")
 			return
 		}
+		expires = now.Add(csLifetime)
 	}
 	rows, err := api.pool.Query(ctx, `SELECT role,content FROM cs_chat_messages WHERE conversation_id=$1 ORDER BY created_at DESC,id DESC LIMIT 40`, cid)
 	if err != nil {
@@ -412,7 +419,7 @@ func (api customerServiceAPI) accountContext(ctx context.Context, id int64) ([]m
 
 func (api customerServiceAPI) generateReply(ctx context.Context, mode, message string, history []csMessage, accounts []map[string]any) (string, error) {
 	if api.key == "" {
-		return "", fmt.Errorf("GEMINI_CS_API_KEY belum dikonfigurasi")
+		return "", fmt.Errorf("GEMINI_API_KEY belum dikonfigurasi")
 	}
 	if api.timeout > 0 {
 		var cancel context.CancelFunc

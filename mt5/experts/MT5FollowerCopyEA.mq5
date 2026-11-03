@@ -39,11 +39,14 @@ string g_halted_symbols[];
 string g_dry_sources[];
 string g_dry_symbols[];
 double g_dry_volumes[];
-bool g_gold_chart_ready = false;
+string g_symbol_cache_keys[];
+string g_symbol_cache_symbols[];
+string g_gold_chart_candidate = "";
 datetime g_gold_chart_last_log = 0;
 datetime g_gold_chart_last_check = 0;
 string g_symbol_suffix = ""; // input SymbolSuffix is read-only in MQL5, so the effective suffix lives here
 ulong g_bridge_sequence = 0;
+ulong g_last_single_chart_check_ms = 0;
 
 string TrimTrailingSlash(string value)
   {
@@ -382,6 +385,18 @@ bool TrySelectBrokerSymbol(const string candidate, string &resolved)
    return true;
   }
 
+long FreshSymbolQuoteTime(const string symbol)
+  {
+   MqlTick tick;
+   if(!SymbolInfoTick(symbol, tick) || tick.bid <= 0.0 || tick.ask <= 0.0)
+      return 0;
+   long quote_time = tick.time_msc > 0 ? tick.time_msc : (long)tick.time * 1000;
+   long server_now = (long)TimeTradeServer() * 1000;
+   if(server_now > 0 && quote_time < server_now - 30 * 60 * 1000)
+      return 0;
+   return quote_time;
+  }
+
 bool ResolveBrokerSymbol(const string requested, const string suffix, const string mapping_csv,
                          string &resolved, string &reason)
   {
@@ -439,14 +454,32 @@ bool ResolveBrokerSymbol(const string requested, const string suffix, const stri
    // start with that key. If the catalog gives no currencies, names are compared
    // as prefixes in either direction.
    string search_for = mapped != "" ? mapped : source;
+   string source_upper = source;
+   StringToUpper(source_upper);
    string search_upper = search_for;
    StringToUpper(search_upper);
    string suffix_upper = suffix;
    StringToUpper(suffix_upper);
+   string cache_key = source_upper + "|" + search_upper + "|" + suffix_upper;
+   for(int cached = 0; cached < ArraySize(g_symbol_cache_keys); cached++)
+     {
+      if(g_symbol_cache_keys[cached] != cache_key)
+         continue;
+      if(FreshSymbolQuoteTime(g_symbol_cache_symbols[cached]) > 0 &&
+         TrySelectBrokerSymbol(g_symbol_cache_symbols[cached], resolved))
+         return true;
+      ArrayRemove(g_symbol_cache_keys, cached, 1);
+      ArrayRemove(g_symbol_cache_symbols, cached, 1);
+      break;
+     }
    string match = "";
    string match_upper = "";
+   int best_data_rank = -1;
+   long best_quote_time = 0;
+   int best_history = 0;
    bool best_exact = false;
    bool best_user = false;
+   bool best_suffix = false;
    int best_common = -1;
    int best_diff = 2147483647;
    int symbols_total = SymbolsTotal(false);
@@ -469,6 +502,12 @@ bool ResolveBrokerSymbol(const string requested, const string suffix, const stri
       if(!related)
          continue;
 
+      if(!SymbolInfoInteger(candidate, SYMBOL_SELECT) && !SymbolSelect(candidate, true))
+         continue;
+      long quote_time = FreshSymbolQuoteTime(candidate);
+      int history = SeriesInfoInteger(candidate, PERIOD_M1, SERIES_BARS_COUNT) > 0 ? 1 : 0;
+      int data_rank = quote_time > 0 ? 2 : (history > 0 ? 1 : 0);
+
       int common = 0;
       int limit = MathMin(StringLen(candidate_upper), StringLen(search_upper));
       while(common < limit && StringGetCharacter(candidate_upper, common) == StringGetCharacter(search_upper, common))
@@ -477,22 +516,42 @@ bool ResolveBrokerSymbol(const string requested, const string suffix, const stri
       bool exact = (candidate_upper == search_upper);
       bool user_pick = (StringLen(suffix_upper) > 0 && StringLen(candidate_upper) > StringLen(suffix_upper) &&
                         StringSubstr(candidate_upper, StringLen(candidate_upper) - StringLen(suffix_upper)) == suffix_upper);
+      bool candidate_suffix = StringLen(candidate_upper) > StringLen(search_upper) &&
+                              StringSubstr(candidate_upper, 0, StringLen(search_upper)) == search_upper;
 
-      // Order: identical name, the user's SymbolSuffix, longest shared name
-      // start, smallest length difference (XAUUSDc before XAUUSD247c), then name.
-      bool better;
-      if(match == "") better = true;
-      else if(exact != best_exact) better = exact;
-      else if(user_pick != best_user) better = user_pick;
-      else if(common != best_common) better = common > best_common;
-      else if(diff != best_diff) better = diff < best_diff;
-      else better = candidate_upper < match_upper;
+      // Prefer the account variant with a current quote, then available history.
+      // If market data is unavailable, use explicit suffix, broker suffix, and
+      // exact-name matches as deterministic fallbacks.
+      bool better = match == "" || data_rank > best_data_rank;
+      if(!better && data_rank == best_data_rank)
+        {
+         if(data_rank == 2 && quote_time != best_quote_time)
+            better = quote_time > best_quote_time;
+         else if(history != best_history)
+            better = history > best_history;
+         else if(user_pick != best_user)
+            better = user_pick;
+         else if(candidate_suffix != best_suffix)
+            better = candidate_suffix;
+         else if(exact != best_exact)
+            better = exact;
+         else if(common != best_common)
+            better = common > best_common;
+         else if(diff != best_diff)
+            better = diff < best_diff;
+         else
+            better = candidate_upper < match_upper;
+        }
       if(better)
         {
          match = candidate;
          match_upper = candidate_upper;
+         best_data_rank = data_rank;
+         best_quote_time = quote_time;
+         best_history = history;
          best_exact = exact;
          best_user = user_pick;
+         best_suffix = candidate_suffix;
          best_common = common;
          best_diff = diff;
         }
@@ -506,6 +565,11 @@ bool ResolveBrokerSymbol(const string requested, const string suffix, const stri
          return false;
         }
       resolved = match;
+      int cache_size = ArraySize(g_symbol_cache_keys);
+      ArrayResize(g_symbol_cache_keys, cache_size + 1);
+      ArrayResize(g_symbol_cache_symbols, cache_size + 1);
+      g_symbol_cache_keys[cache_size] = cache_key;
+      g_symbol_cache_symbols[cache_size] = match;
       Print("[MT5FollowerCopyEA] auto-selected broker symbol ", resolved,
             " for ", search_for, " from ", symbols_total,
             " broker symbols; shown in Market Watch");
@@ -515,49 +579,145 @@ bool ResolveBrokerSymbol(const string requested, const string suffix, const stri
    return false;
   }
 
+bool ResolveGoldChartSymbol(string &resolved)
+  {
+   resolved = "";
+   string mappings[];
+   int mapping_count = StringSplit(SymbolMapCsv, ',', mappings);
+   for(int i = 0; i < mapping_count; i++)
+     {
+      string item = mappings[i];
+      StringTrimLeft(item);
+      StringTrimRight(item);
+      int equal_at = StringFind(item, "=");
+      if(equal_at <= 0)
+         continue;
+      string from_symbol = StringSubstr(item, 0, equal_at);
+      string to_symbol = StringSubstr(item, equal_at + 1);
+      StringTrimLeft(from_symbol);
+      StringTrimRight(from_symbol);
+      StringTrimLeft(to_symbol);
+      StringTrimRight(to_symbol);
+      StringToUpper(from_symbol);
+      if(from_symbol == "XAUUSD" && TrySelectBrokerSymbol(to_symbol, resolved))
+         return true; // Explicit account mapping takes precedence over discovery.
+     }
+
+   string best = "";
+   string best_upper = "";
+   string suffix_upper = g_symbol_suffix;
+   StringToUpper(suffix_upper);
+   int best_data_rank = -1; // fresh quote > local/server M1 history > catalog only
+   int best_history = 0;
+   long best_quote_time = 0;
+   bool best_user_pick = false;
+   bool best_has_suffix = false;
+   int best_suffix_length = 2147483647;
+   int symbols_total = SymbolsTotal(false);
+   for(int i = 0; i < symbols_total; i++)
+     {
+      string candidate = SymbolName(i, false);
+      string upper = candidate;
+      StringToUpper(upper);
+      if(SymbolInfoInteger(candidate, SYMBOL_TRADE_MODE) == SYMBOL_TRADE_MODE_DISABLED ||
+         !SymbolSelect(candidate, true))
+         continue;
+
+      string base_currency = SymbolInfoString(candidate, SYMBOL_CURRENCY_BASE);
+      string profit_currency = SymbolInfoString(candidate, SYMBOL_CURRENCY_PROFIT);
+      StringToUpper(base_currency);
+      StringToUpper(profit_currency);
+      bool gold_candidate = StringSubstr(upper, 0, 6) == "XAUUSD" ||
+                            (base_currency == "XAU" && profit_currency == "USD");
+      if(!gold_candidate)
+         continue;
+
+      // Request history so MT5 starts loading bars for variants that have not
+      // been opened before. A bare catalog entry can exist without chart data.
+      MqlRates rates[1];
+      int copied = CopyRates(candidate, PERIOD_M1, 0, 1, rates);
+      int history = copied > 0 || SeriesInfoInteger(candidate, PERIOD_M1, SERIES_BARS_COUNT) > 0 ? 1 : 0;
+
+      MqlTick tick;
+      long quote_time = 0;
+      if(SymbolInfoTick(candidate, tick) && tick.bid > 0.0 && tick.ask > 0.0)
+         quote_time = tick.time_msc > 0 ? tick.time_msc : (long)tick.time * 1000;
+      long server_now = (long)TimeTradeServer() * 1000;
+      if(server_now > 0 && quote_time < server_now - 30 * 60 * 1000)
+         quote_time = 0;
+
+      bool has_xauusd_prefix = StringSubstr(upper, 0, 6) == "XAUUSD";
+      int suffix_length = has_xauusd_prefix ? StringLen(candidate) - 6 : StringLen(candidate);
+      bool has_suffix = !has_xauusd_prefix || suffix_length > 0;
+      bool user_pick = StringLen(suffix_upper) > 0 && StringLen(upper) > StringLen(suffix_upper) &&
+                       StringSubstr(upper, StringLen(upper) - StringLen(suffix_upper)) == suffix_upper;
+      int data_rank = quote_time > 0 ? 2 : (history > 0 ? 1 : 0);
+      bool better = best == "" || data_rank > best_data_rank;
+      if(!better && data_rank == best_data_rank)
+        {
+         if(data_rank == 2 && quote_time != best_quote_time)
+            better = quote_time > best_quote_time;
+         else if(history != best_history)
+            better = history > best_history;
+         else if(user_pick != best_user_pick)
+            better = user_pick;
+         else if(has_suffix != best_has_suffix)
+            better = has_suffix;
+         else if(suffix_length != best_suffix_length)
+            better = suffix_length < best_suffix_length;
+         else
+            better = upper < best_upper;
+        }
+      if(better)
+        {
+         best = candidate;
+         best_upper = upper;
+         best_data_rank = data_rank;
+         best_history = history;
+         best_quote_time = quote_time;
+         best_user_pick = user_pick;
+         best_has_suffix = has_suffix;
+         best_suffix_length = suffix_length;
+        }
+     }
+   if(best == "")
+      return false;
+   resolved = best;
+   if(g_gold_chart_candidate != best)
+     {
+      Print("[MT5FollowerCopyEA] account gold symbol selected: ", best,
+            "; quote rank=", best_data_rank, "; M1 history=", best_history);
+      g_gold_chart_candidate = best;
+     }
+   return true;
+  }
+
 void EnsureDefaultGoldChart()
   {
-   if(g_gold_chart_ready && TimeCurrent() - g_gold_chart_last_check < 10)
+   if(g_gold_chart_last_check > 0 && TimeCurrent() - g_gold_chart_last_check < 10)
       return;
    g_gold_chart_last_check = TimeCurrent();
 
-   // Shared rule with MT5LoginProbe: if the chart already shows any tradable
-   // XAUUSD variant, keep it. Both EAs previously picked a "best" variant with
-   // different rules and kept switching the chart back and forth, and every
-   // switch reloads the EA.
-   string current_symbol = ChartSymbol(0);
-   string current_upper = current_symbol;
-   StringToUpper(current_upper);
-   // Only keep it when it really has data: an XAUUSD chart that is black
-   // (no bars) must be replaced by the variant the account supports.
-   if(StringFind(current_upper, "XAUUSD") == 0 &&
-      SymbolInfoInteger(current_symbol, SYMBOL_TRADE_MODE) != SYMBOL_TRADE_MODE_DISABLED &&
-      SeriesInfoInteger(current_symbol, PERIOD_M1, SERIES_BARS_COUNT) > 0)
-     {
-      if(ChartPeriod(0) == PERIOD_M1)
-        {
-         g_gold_chart_ready = true;
-         return;
-        }
-      ResetLastError();
-      ChartSetSymbolPeriod(0, current_symbol, PERIOD_M1); // change timeframe only
-      return;
-     }
-
-   string gold_symbol, reason;
-   if(!ResolveBrokerSymbol("XAUUSD", g_symbol_suffix, SymbolMapCsv, gold_symbol, reason))
+   string gold_symbol;
+   if(!ResolveGoldChartSymbol(gold_symbol))
      {
       if(TimeCurrent() - g_gold_chart_last_log >= 15)
         {
-         Print("[MT5FollowerCopyEA] gold chart not available yet: ", reason);
+         Print("[MT5FollowerCopyEA] no tradable XAUUSD variant is available in the broker symbol catalog yet");
          g_gold_chart_last_log = TimeCurrent();
         }
       return;
      }
    if(ChartSymbol(0) == gold_symbol && ChartPeriod(0) == PERIOD_M1)
      {
-      g_gold_chart_ready = true;
-      Print("[MT5FollowerCopyEA] default gold chart: ", gold_symbol, ", M1");
+      int bars = (int)SeriesInfoInteger(gold_symbol, PERIOD_M1, SERIES_BARS_COUNT);
+      if(bars <= 0 && TimeCurrent() - g_gold_chart_last_log >= 15)
+        {
+         Print("[MT5FollowerCopyEA] waiting for M1 history on account-supported gold symbol ", gold_symbol);
+         g_gold_chart_last_log = TimeCurrent();
+        }
+      else if(bars > 0)
+         Print("[MT5FollowerCopyEA] default gold chart ready: ", gold_symbol, ", M1, bars=", bars);
       return;
      }
    ResetLastError();
@@ -565,7 +725,7 @@ void EnsureDefaultGoldChart()
      {
       // ChartSetSymbolPeriod queues an asynchronous chart change. Do not mark
       // this complete until the next initialization sees the requested chart.
-      Print("[MT5FollowerCopyEA] requested chart switch to ", gold_symbol,
+      Print("[MT5FollowerCopyEA] requested data-backed gold chart ", gold_symbol,
             ", M1; waiting for MT5 to apply it");
      }
    else if(TimeCurrent() - g_gold_chart_last_log >= 15)
@@ -584,6 +744,11 @@ void KeepSingleManagedChart()
    if(!ManagedMode)
       return;
 
+   ulong now_ms = GetTickCount64();
+   if(g_last_single_chart_check_ms > 0 && now_ms - g_last_single_chart_check_ms < 5000)
+      return;
+   g_last_single_chart_check_ms = now_ms;
+
    long active_chart = ChartID();
    long chart_id = ChartFirst();
    int closed = 0;
@@ -600,6 +765,8 @@ void KeepSingleManagedChart()
         }
       chart_id = next_chart;
      }
+   ChartSetInteger(active_chart, CHART_BRING_TO_TOP, true);
+   ChartRedraw(active_chart);
    if(closed > 0)
       Print("[MT5FollowerCopyEA] managed terminal kept its EA chart and closed ", closed,
             " extra chart(s)");
@@ -1499,6 +1666,7 @@ void OnDeinit(const int reason)
 
 void OnTimer()
   {
+   KeepSingleManagedChart();
    EnsureDefaultGoldChart();
    ReportAccountState();
    PollAndCopy();

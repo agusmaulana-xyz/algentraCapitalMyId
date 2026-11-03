@@ -15,7 +15,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/jackc/pgx/v5"
 	"github.com/rnpproject/algentra-backend/internal/security"
 	"github.com/rnpproject/algentra-backend/internal/textutil"
 )
@@ -70,7 +69,7 @@ func (api clientMT5API) configureManagedCopy(w http.ResponseWriter, r *http.Requ
 		writeError(w, 422, "Pengaturan managed copy tidak valid")
 		return
 	}
-	password, symbol, mode := p.BrokerPassword.Value, "XAUUSD", "rasio"
+	password, symbol, mode := p.BrokerPassword.Value, "", "rasio"
 	ratio, fixedLot, orderLot, totalLot, positions := 1.0, 0.01, 0.05, 0.10, 3
 	if p.FollowerSymbol.Present {
 		symbol = p.FollowerSymbol.Value
@@ -93,7 +92,7 @@ func (api clientMT5API) configureManagedCopy(w http.ResponseWriter, r *http.Requ
 	if p.MaxOpenPositions.Present {
 		positions = p.MaxOpenPositions.Value
 	}
-	if !validLength(password, 1, 128) || !validLength(symbol, 1, 64) || !followerSymbolInput.MatchString(symbol) || (mode != "tetap" && mode != "rasio") || !finite(ratio) || ratio <= 0 || ratio > 5 || !finite(fixedLot) || fixedLot <= 0 || fixedLot > 5 || !finite(orderLot) || orderLot <= 0 || orderLot > 5 || !finite(totalLot) || totalLot <= 0 || totalLot > 10 || orderLot > totalLot || positions < 1 || positions > 50 {
+	if !validLength(password, 1, 128) || len(symbol) > 64 || (symbol != "" && !followerSymbolInput.MatchString(symbol)) || (mode != "tetap" && mode != "rasio") || !finite(ratio) || ratio <= 0 || ratio > 5 || !finite(fixedLot) || fixedLot <= 0 || fixedLot > 5 || !finite(orderLot) || orderLot <= 0 || orderLot > 5 || !finite(totalLot) || totalLot <= 0 || totalLot > 10 || orderLot > totalLot || positions < 1 || positions > 50 {
 		writeError(w, 422, "Pengaturan lot atau kredensial broker tidak valid")
 		return
 	}
@@ -109,7 +108,7 @@ func (api clientMT5API) configureManagedCopy(w http.ResponseWriter, r *http.Requ
 	}
 	defer tx.Rollback(ctx)
 	var executionMode string
-	if err = tx.QueryRow(ctx, `SELECT execution_mode FROM mt5_accounts WHERE id=$1 AND owner_id=$2 FOR UPDATE`, accountID, ownerID).Scan(&executionMode); errors.Is(err, pgx.ErrNoRows) {
+	if err = tx.QueryRow(ctx, `SELECT execution_mode FROM mt5_accounts WHERE id=$1 AND owner_id=$2 FOR UPDATE`, accountID, ownerID).Scan(&executionMode); errors.Is(err, sql.ErrNoRows) {
 		writeError(w, 404, "Akun MT5 tidak ditemukan")
 		return
 	} else if err != nil {
@@ -123,7 +122,7 @@ func (api clientMT5API) configureManagedCopy(w http.ResponseWriter, r *http.Requ
 	var active bool
 	err = tx.QueryRow(ctx, `SELECT active FROM managed_copy_profiles WHERE account_id=$1 FOR UPDATE`, accountID).Scan(&active)
 	exists := err == nil
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		writeError(w, 503, "Profil managed copy tidak tersedia")
 		return
 	}
@@ -192,7 +191,7 @@ func (api clientMT5API) setManagedCopyActive(w http.ResponseWriter, r *http.Requ
 	}
 	defer tx.Rollback(ctx)
 	var mode string
-	if err = tx.QueryRow(ctx, `SELECT execution_mode FROM mt5_accounts WHERE id=$1 AND owner_id=$2 FOR UPDATE`, accountID, ownerID).Scan(&mode); errors.Is(err, pgx.ErrNoRows) {
+	if err = tx.QueryRow(ctx, `SELECT execution_mode FROM mt5_accounts WHERE id=$1 AND owner_id=$2 FOR UPDATE`, accountID, ownerID).Scan(&mode); errors.Is(err, sql.ErrNoRows) {
 		writeError(w, 404, "Akun MT5 tidak ditemukan")
 		return
 	} else if err != nil {
@@ -205,7 +204,7 @@ func (api clientMT5API) setManagedCopyActive(w http.ResponseWriter, r *http.Requ
 	}
 	var loginStatus string
 	err = tx.QueryRow(ctx, `SELECT login_status FROM managed_copy_profiles WHERE account_id=$1 FOR UPDATE`, accountID).Scan(&loginStatus)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, 409, "Simpan pengaturan dan kredensial broker terlebih dahulu")
 		return
 	}
@@ -279,7 +278,7 @@ func (api clientMT5API) setAccountActive(w http.ResponseWriter, r *http.Request)
 	}
 	var mode string
 	err := api.pool.QueryRow(ctx, `SELECT execution_mode FROM mt5_accounts WHERE id=$1 AND owner_id=$2`, id, ownerID).Scan(&mode)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, 404, "Akun MT5 tidak ditemukan")
 		return
 	}
@@ -330,7 +329,7 @@ func (api clientMT5API) updateAccount(w http.ResponseWriter, r *http.Request) {
 	defer tx.Rollback(ctx)
 	var mode, oldServer, oldLogin string
 	err = tx.QueryRow(ctx, `SELECT execution_mode,server,login FROM mt5_accounts WHERE id=$1 AND owner_id=$2 FOR UPDATE`, id, ownerID).Scan(&mode, &oldServer, &oldLogin)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, 404, "Akun MT5 tidak ditemukan")
 		return
 	}
@@ -341,7 +340,7 @@ func (api clientMT5API) updateAccount(w http.ResponseWriter, r *http.Request) {
 	if mode == "MANAGED" {
 		var active bool
 		err = tx.QueryRow(ctx, `SELECT active FROM managed_copy_profiles WHERE account_id=$1 FOR UPDATE`, id).Scan(&active)
-		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		if err != nil && !errors.Is(err, sql.ErrNoRows) {
 			writeError(w, 503, "Status managed copy tidak tersedia")
 			return
 		}
@@ -357,6 +356,12 @@ func (api clientMT5API) updateAccount(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			writeError(w, 503, "Riwayat akun tidak dapat dihapus")
 			return
+		}
+		if mode == "MANAGED" {
+			if _, err = tx.Exec(ctx, `UPDATE managed_copy_profiles SET password_ciphertext='',login_status='UNCHECKED',login_message='Detail akun MT5 berubah. Masukkan ulang password broker untuk memeriksa login.',active=FALSE,status='PAUSED',status_message=NULL,last_seen_at=NULL,updated_at=$2 WHERE account_id=$1`, id, time.Now().UTC()); err != nil {
+				writeError(w, 503, "Kredensial dan status login akun tidak dapat diatur ulang")
+				return
+			}
 		}
 	}
 	_, err = tx.Exec(ctx, `UPDATE mt5_accounts SET label=$3,server=$4,login=$5,last_seen_at=CASE WHEN lower(server)<>lower($4) OR login<>$5 THEN NULL ELSE last_seen_at END WHERE id=$1 AND owner_id=$2`, id, ownerID, p.Label, p.Server, p.Login)
@@ -385,7 +390,7 @@ func (api clientMT5API) writeAccountPayload(ctx context.Context, w http.Response
 	var observed sql.NullTime
 	var terminalAllowed, expertAllowed sql.NullBool
 	err := api.pool.QueryRow(ctx, `SELECT a.label,a.server,a.login,a.plan,a.execution_mode,a.active,a.last_seen_at,a.created_at,s.balance,s.equity,s.floating_profit,s.currency,s.trade_mode,s.observed_at,s.terminal_trade_allowed,s.expert_trade_allowed FROM mt5_accounts a LEFT JOIN mt5_account_state s ON s.account_id=a.id WHERE a.id=$1 AND a.owner_id=$2`, id, ownerID).Scan(&label, &server, &login, &plan, &mode, &active, &lastSeen, &created, &balance, &equity, &floating, &currency, &tradeMode, &observed, &terminalAllowed, &expertAllowed)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		writeError(w, 404, "Akun MT5 tidak ditemukan")
 		return
 	}
@@ -444,7 +449,7 @@ func (api clientMT5API) followerPositions(w http.ResponseWriter, r *http.Request
 	ctx, cancel := context.WithTimeout(r.Context(), 8*time.Second)
 	defer cancel()
 	account, err := api.accountByToken(ctx, r)
-	if errors.Is(err, errAccountTokenInvalid) || errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, errAccountTokenInvalid) || errors.Is(err, sql.ErrNoRows) {
 		status := 401
 		message := "Token akun tidak valid atau dinonaktifkan"
 		if errors.Is(err, errAccountTokenManaged) {
@@ -473,7 +478,7 @@ func (api clientMT5API) followerPositions(w http.ResponseWriter, r *http.Request
 	var cursor string
 	var cursorMSC int64
 	err = api.pool.QueryRow(ctx, `SELECT history_cursor,history_cursor_msc FROM mt5_account_state WHERE account_id=$1`, account.id).Scan(&cursor, &cursorMSC)
-	if errors.Is(err, pgx.ErrNoRows) {
+	if errors.Is(err, sql.ErrNoRows) {
 		cursor = "0"
 		cursorMSC = 0
 	} else if err != nil {
@@ -492,7 +497,7 @@ func (api clientMT5API) reportFollower(w http.ResponseWriter, r *http.Request) {
 	defer cancel()
 	account, err := api.accountByToken(ctx, r)
 	if err != nil {
-		if !errors.Is(err, pgx.ErrNoRows) && !errors.Is(err, errAccountTokenInvalid) && !errors.Is(err, errAccountTokenManaged) && !errors.Is(err, errAccountTokenIdentity) {
+		if !errors.Is(err, sql.ErrNoRows) && !errors.Is(err, errAccountTokenInvalid) && !errors.Is(err, errAccountTokenManaged) && !errors.Is(err, errAccountTokenIdentity) {
 			writeError(w, 503, "Autentikasi akun MT5 tidak tersedia")
 			return
 		}
@@ -523,7 +528,7 @@ func (api clientMT5API) reportFollower(w http.ResponseWriter, r *http.Request) {
 	positions, _ := json.Marshal(sortedUnique(p.OpenPositionIDs))
 	cursor, cursorMSC := "0", int64(0)
 	err = tx.QueryRow(ctx, `SELECT history_cursor,history_cursor_msc FROM mt5_account_state WHERE account_id=$1 FOR UPDATE`, account.id).Scan(&cursor, &cursorMSC)
-	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		writeError(w, 503, "Laporan akun MT5 tidak dapat disimpan")
 		return
 	}

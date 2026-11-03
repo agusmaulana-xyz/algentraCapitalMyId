@@ -8,12 +8,7 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
-	"errors"
 	"fmt"
-	"io"
-	"net"
-	"net/http"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -35,6 +30,7 @@ type probeStatus struct {
 	Message string `json:"message"`
 	Login   int64  `json:"login"`
 	Server  string `json:"server"`
+	Symbol  string `json:"symbol"`
 }
 
 func (w *worker) validateLogin(check loginCheck) (bool, string) {
@@ -53,8 +49,6 @@ func (w *worker) probeLogin(check loginCheck) (bool, string) {
 	}
 	accountDir := filepath.Join(w.cfg.runtimeDir, "terminals", fmt.Sprint(check.AccountID))
 	terminal := filepath.Join(accountDir, "terminal64.exe")
-	accessPoint, lookupErr := findBrokerAccessPoint(server)
-
 	// Terminal sisa dari pemeriksaan sebelumnya (timeout) masih mengunci file,
 	// folder data, dan port MCP 22346. Tutup dulu sebelum memulai yang baru.
 	w.killTerminalsIn(accountDir)
@@ -70,11 +64,8 @@ func (w *worker) probeLogin(check loginCheck) (bool, string) {
 	if _, err := os.Stat(terminal); err != nil {
 		return false, "Terminal follower tidak tersedia pada server."
 	}
-	if lookupErr != nil {
-		if err := seedBrokerServers(accountDir, w.cfg.templateDir, w.cfg.masterTerminalPath); err != nil {
-			return false, "Pencarian server broker gagal dan direktori server lokal MT5 belum tersedia. Pastikan nama server benar dan koneksi internet worker aktif, lalu coba lagi."
-		}
-		accessPoint = server
+	if err := ensureNativeBrokerServers(accountDir, w.cfg.templateDir, w.cfg.masterTerminalPath, server); err != nil {
+		return false, "Daftar server broker MT5 tidak tersedia. Pastikan terminal MT5 worker sudah memuat perusahaan/server broker ini, lalu coba lagi."
 	}
 	source := filepath.Join(w.cfg.projectRoot, "mt5", "experts", "Algentra", "MT5LoginProbe.ex5")
 	target := filepath.Join(accountDir, "MQL5", "Experts", "Algentra", "MT5LoginProbe.ex5")
@@ -84,6 +75,7 @@ func (w *worker) probeLogin(check loginCheck) (bool, string) {
 		}
 		return false, "Expert MT5LoginProbe.ex5 belum dikompilasi pada server."
 	}
+	clearSavedCharts(accountDir)
 	if err := enableAutoTrading(accountDir); err != nil {
 		if isTerminalFileBusy(err) {
 			return false, terminalInUseMessage
@@ -132,11 +124,38 @@ func (w *worker) probeLogin(check loginCheck) (bool, string) {
 	defer os.RemoveAll(probeDir)
 	_ = os.Chmod(probeDir, 0o700)
 	iniPath := filepath.Join(probeDir, "login-probe.ini")
+	// A server no terminal here knows yet is reached through its access point.
+	loginServer := w.loginServerFor(accountDir, server)
+	startupSymbol := w.knownAccountSymbol(check.AccountID, login, accountDir)
+	if startupSymbol == "" {
+		// New account: let the broker sync once so the chart can open on a
+		// symbol the account really has, instead of guessing XAUUSD.
+		bootstrapINI := filepath.Join(probeDir, "login-bootstrap.ini")
+		bootstrap := strings.Join([]string{
+			"[Common]",
+			"Login=" + strconv.FormatInt(login, 10),
+			"Password=" + check.BrokerPassword,
+			"Server=" + loginServer,
+			"KeepPrivate=1",
+			"NewsEnable=0",
+			"ProxyEnable=0",
+			"",
+		}, "\r\n")
+		if err := os.WriteFile(bootstrapINI, []byte(bootstrap), 0o600); err != nil {
+			return false, "Worker tidak dapat menulis konfigurasi startup terminal MT5."
+		}
+		startupSymbol = w.bootstrapAccountSymbols(terminal, accountDir, bootstrapINI, login)
+		_ = os.Remove(bootstrapINI)
+		clearSavedCharts(accountDir)
+		if startupSymbol == "" {
+			startupSymbol = "XAUUSD"
+		}
+	}
 	ini := strings.Join([]string{
 		"[Common]",
 		"Login=" + strconv.FormatInt(login, 10),
 		"Password=" + check.BrokerPassword,
-		"Server=" + accessPoint,
+		"Server=" + loginServer,
 		"KeepPrivate=1",
 		"NewsEnable=0",
 		"ProxyEnable=0",
@@ -151,7 +170,7 @@ func (w *worker) probeLogin(check loginCheck) (bool, string) {
 		"[StartUp]",
 		`Expert=Algentra\MT5LoginProbe`,
 		"ExpertParameters=" + presetName,
-		"Symbol=XAUUSD",
+		"Symbol=" + startupSymbol,
 		"Period=M1",
 		"",
 	}, "\r\n")
@@ -171,6 +190,9 @@ func (w *worker) probeLogin(check loginCheck) (bool, string) {
 	if err := cmd.Start(); err != nil {
 		return false, "Terminal MT5 tidak dapat dijalankan oleh worker."
 	}
+	chartMonitorStop := make(chan struct{})
+	go manageMT5Charts(uint32(cmd.Process.Pid), chartMonitorStop, true)
+	defer close(chartMonitorStop)
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
 	exited := false
@@ -199,11 +221,11 @@ func (w *worker) probeLogin(check loginCheck) (bool, string) {
 				status, ok = readProbeStatusFromLogs(accountDir, offsets)
 			}
 			if ok && status.Ready {
-				return validateProbeResult(status, login, server)
+				return w.validateProbeResult(status, login, server, loginServer, check.AccountID)
 			}
 			authorized, reason := scanAuthLog(accountDir, offsets, login)
 			if reason != "" {
-				message, _ := authFailureMessage(reason)
+				message, _ := authFailureMessageForServer(reason, server)
 				return false, message
 			}
 			if authorized {
@@ -219,7 +241,7 @@ func (w *worker) probeLogin(check loginCheck) (bool, string) {
 			case authorized && !seen:
 				return false, "Login broker berhasil, tetapi Expert MT5LoginProbe tidak melapor. Periksa Auto Trading dan kompilasi expert."
 			case reason != "":
-				message, _ := authFailureMessage(reason)
+				message, _ := authFailureMessageForServer(reason, server)
 				return false, message
 			case seen && last.Message != "" && !strings.Contains(strings.ToLower(last.Message), "menunggu koneksi broker"):
 				return false, last.Message
@@ -235,12 +257,12 @@ func (w *worker) probeLogin(check loginCheck) (bool, string) {
 		if ok {
 			last, seen = status, true
 			if status.Ready {
-				return validateProbeResult(status, login, server)
+				return w.validateProbeResult(status, login, server, loginServer, check.AccountID)
 			}
 		}
 		if n%3 == 2 {
 			if _, reason := scanAuthLog(accountDir, offsets, login); reason != "" {
-				if message, definitive := authFailureMessage(reason); definitive {
+				if message, definitive := authFailureMessageForServer(reason, server); definitive {
 					return false, message
 				}
 			}
@@ -248,71 +270,62 @@ func (w *worker) probeLogin(check loginCheck) (bool, string) {
 	}
 }
 
-type brokerDirectoryCompany struct {
-	CompanyName string                 `json:"companyName"`
-	Results     []brokerDirectoryEntry `json:"results"`
+// ensureNativeBrokerServers keeps an existing terminal catalog, or seeds an
+// isolated terminal from the user's installed MT5 before using its logical
+// company/server name for account login.
+func ensureNativeBrokerServers(accountDir, templateDir, masterTerminalPath, server string) error {
+	path := filepath.Join(accountDir, "Config", "servers.dat")
+	if info, err := os.Stat(path); err == nil && !info.IsDir() && info.Size() > 0 {
+		if strings.TrimSpace(server) == "" || dirExists(filepath.Join(accountDir, "bases", server)) {
+			return nil
+		}
+		// MT5 never tries to log in to a server missing from its catalog (it only
+		// shows a default "Netting" account). Copy the catalog from a terminal
+		// that has really connected to this server.
+		if source := terminalCatalogWithServer(server, masterTerminalPath); source != "" &&
+			filepath.Clean(source) != filepath.Clean(path) {
+			return copyFile(source, path)
+		}
+		return nil
+	}
+	return seedBrokerServers(accountDir, templateDir, masterTerminalPath)
 }
 
-type brokerDirectoryEntry struct {
-	Name   string   `json:"name"`
-	Access []string `json:"access"`
+func dirExists(path string) bool {
+	info, err := os.Stat(path)
+	return err == nil && info.IsDir()
 }
 
-// findBrokerAccessPoint refreshes the exact logical MT5 server through the
-// broker directory. Only the public server name is sent; account credentials
-// are never sent to the directory provider. MT5 accepts a host:port in the
-// startup Server field and reports the logical broker server after login.
-func findBrokerAccessPoint(server string) (string, error) {
-	endpoint := strings.TrimSpace(os.Getenv("MT5_BROKER_DIRECTORY_URL"))
-	if endpoint == "" {
-		endpoint = "https://mt5.mtapi.io/Search"
+// terminalCatalogWithServer returns the newest servers.dat of a terminal on this
+// machine whose data folder contains bases\<server>, i.e. one that knows it.
+func terminalCatalogWithServer(server, masterTerminalPath string) string {
+	var roots []string
+	if strings.TrimSpace(masterTerminalPath) != "" {
+		roots = append(roots, filepath.Dir(masterTerminalPath))
 	}
-	parsedEndpoint, err := url.Parse(endpoint)
-	if err != nil || parsedEndpoint.Scheme != "https" || parsedEndpoint.Host == "" || parsedEndpoint.User != nil || parsedEndpoint.RawQuery != "" || parsedEndpoint.Fragment != "" {
-		return "", errors.New("MT5_BROKER_DIRECTORY_URL must be an HTTPS search endpoint")
-	}
-	query := url.Values{}
-	query.Set("company", server)
-	request, err := http.NewRequest(http.MethodGet, endpoint+"?"+query.Encode(), nil)
-	if err != nil {
-		return "", err
-	}
-	request.Header.Set("Accept", "application/json")
-	client := &http.Client{Timeout: 8 * time.Second}
-	response, err := client.Do(request)
-	if err != nil {
-		return "", err
-	}
-	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 {
-		return "", fmt.Errorf("broker directory returned %s", response.Status)
-	}
-	var companies []brokerDirectoryCompany
-	if err := json.NewDecoder(io.LimitReader(response.Body, 2<<20)).Decode(&companies); err != nil {
-		return "", err
-	}
-	for _, company := range companies {
-		for _, candidate := range company.Results {
-			if !strings.EqualFold(strings.TrimSpace(candidate.Name), strings.TrimSpace(server)) {
-				continue
-			}
-			for _, access := range candidate.Access {
-				if validBrokerAccessPoint(access) {
-					return strings.TrimSpace(access), nil
-				}
+	if appData := os.Getenv("APPDATA"); appData != "" {
+		terminalDataRoot := filepath.Join(appData, "MetaQuotes", "Terminal")
+		entries, _ := os.ReadDir(terminalDataRoot)
+		for _, entry := range entries {
+			if entry.IsDir() {
+				roots = append(roots, filepath.Join(terminalDataRoot, entry.Name()))
 			}
 		}
 	}
-	return "", fmt.Errorf("server %q tidak ditemukan di direktori broker", server)
-}
-
-func validBrokerAccessPoint(value string) bool {
-	host, portText, err := net.SplitHostPort(strings.TrimSpace(value))
-	if err != nil || host == "" || strings.ContainsAny(host, " \t/\\") {
-		return false
+	var best string
+	var bestAt time.Time
+	for _, root := range roots {
+		if !dirExists(filepath.Join(root, "bases", server)) {
+			continue
+		}
+		for _, name := range []string{"Config", "config"} {
+			candidate := filepath.Join(root, name, "servers.dat")
+			if info, err := os.Stat(candidate); err == nil && !info.IsDir() && info.Size() > 0 && info.ModTime().After(bestAt) {
+				best, bestAt = candidate, info.ModTime()
+			}
+		}
 	}
-	port, err := strconv.Atoi(portText)
-	return err == nil && port > 0 && port <= 65535
+	return best
 }
 
 // seedBrokerServers copies MT5's broker directory into the portable follower.
@@ -395,12 +408,23 @@ func normalizedWindowsPath(value string) string {
 	return strings.ToLower(filepath.Clean(value))
 }
 
-func validateProbeResult(status probeStatus, login int64, expectedServer string) (bool, string) {
+func (w *worker) validateProbeResult(status probeStatus, login int64, expectedServer, loginServer string, accountID int64) (bool, string) {
 	if status.Login != login {
 		return false, "Terminal login ke akun lain dari yang didaftarkan."
 	}
-	if !strings.EqualFold(strings.TrimSpace(status.Server), strings.TrimSpace(expectedServer)) {
+	reported := strings.TrimSpace(status.Server)
+	if !strings.EqualFold(reported, strings.TrimSpace(expectedServer)) && !strings.EqualFold(reported, strings.TrimSpace(loginServer)) {
 		return false, fmt.Sprintf("Server broker tidak cocok (diminta: %s; terminal: %s).", expectedServer, status.Server)
+	}
+	if status.Valid && status.Symbol != "" {
+		symbol := strings.TrimSpace(status.Symbol)
+		if strings.ContainsAny(symbol, "\r\n,=") {
+			return false, "Nama simbol gold dari terminal MT5 tidak valid."
+		}
+		path := filepath.Join(w.cfg.runtimeDir, "states", fmt.Sprintf("%d.gold-symbol", accountID))
+		if err := writeAtomic(path, []byte(symbol+"\n")); err != nil {
+			return false, "Login broker berhasil, tetapi simbol gold akun tidak dapat disimpan untuk copier."
+		}
 	}
 	return status.Valid, status.Message
 }
@@ -537,6 +561,14 @@ func authFailureMessage(reason string) (string, bool) {
 	default:
 		return "Broker menolak login: " + reason + ".", false
 	}
+}
+
+func authFailureMessageForServer(reason, requestedServer string) (string, bool) {
+	message, definitive := authFailureMessage(reason)
+	if strings.Contains(strings.ToLower(reason), "invalid account") {
+		return fmt.Sprintf("Broker menolak login pada server %q (Invalid account). Di MT5, cari broker melalui Open an Account > Find your company, pilih server akun yang benar, lalu pastikan nomor akun dan password trading (bukan investor password) sesuai.", requestedServer), true
+	}
+	return message, definitive
 }
 
 // killTerminalsIn menghentikan terminal64.exe yang berjalan dari folder akun

@@ -27,3 +27,16 @@ func TestLoginRequestsAreRateLimited(t *testing.T) {
 		t.Fatalf("downstream handler called %d times", called)
 	}
 }
+
+func TestWorkerReportsAreNotThrottledAtDefaultLimit(t *testing.T) {
+	handler := RateLimit(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	for i := 0; i < 600; i++ {
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, httptest.NewRequest(http.MethodPost, "/api/mt5/copier/jobs/1/report", nil))
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("request %d status = %d", i+1, w.Code)
+		}
+	}
+}

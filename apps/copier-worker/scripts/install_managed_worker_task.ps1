@@ -2,23 +2,47 @@ param(
     [string]$ProjectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..\..\..")).Path,
     [string]$ApiBaseUrl,
     [string]$TerminalTemplateDir,
+    [string]$MT5SourceTerminalDir,
     [string]$MasterTerminalPath,
     [string]$SignalDirectory
 )
 
+$ErrorActionPreference = 'Stop'
 $resolvedRoot = (Resolve-Path -LiteralPath $ProjectRoot).Path
 $workerBinary = Join-Path $resolvedRoot "algentra-copier-worker.exe"
-$configDirectory = Join-Path $resolvedRoot "apps\copier-worker\config"
+if (-not (Test-Path -LiteralPath $workerBinary -PathType Leaf)) { $workerBinary = Join-Path $resolvedRoot "bin\copier-worker.exe" }
+$masterPublisher = Join-Path $resolvedRoot "algentra-copier-master.exe"
+if (-not (Test-Path -LiteralPath $masterPublisher -PathType Leaf)) { $masterPublisher = Join-Path $resolvedRoot "bin\copier-master.exe" }
+$workerPackage = Join-Path $resolvedRoot "apps\copier-worker"
+if (-not (Test-Path -LiteralPath $workerPackage -PathType Container)) { $workerPackage = Join-Path $resolvedRoot "mt5\copier-worker" }
+$configDirectory = Join-Path $workerPackage "config"
 $workerConfigPath = Join-Path $configDirectory "managed-worker.json"
 $workerExamplePath = Join-Path $configDirectory "managed-worker.example.json"
 $masterConfigPath = Join-Path $configDirectory "master.json"
 $masterExamplePath = Join-Path $configDirectory "master.example.json"
 if (-not (Test-Path -LiteralPath $workerBinary -PathType Leaf)) {
-	throw "Binary managed worker Go tidak ditemukan: $workerBinary. Build dengan go build -o algentra-copier-worker.exe ./cmd/copier-worker terlebih dahulu."
+	$go = Get-Command go.exe -ErrorAction SilentlyContinue
+	if ((Test-Path -LiteralPath (Join-Path $resolvedRoot 'go.mod') -PathType Leaf) -and $go) {
+		New-Item -ItemType Directory -Path (Join-Path $resolvedRoot 'bin') -Force | Out-Null
+		$workerBinary = Join-Path $resolvedRoot 'bin\copier-worker.exe'
+		Push-Location $resolvedRoot
+		try { & $go.Source build -ldflags='-s -w' -o $workerBinary ./cmd/copier-worker } finally { Pop-Location }
+		if ($LASTEXITCODE -ne 0) { throw 'Build binary copier-worker gagal.' }
+	} else {
+		throw "Binary managed worker Go tidak ditemukan: $workerBinary. Paket produksi harus menyertakan bin\copier-worker.exe."
+	}
 }
-$masterPublisher = Join-Path $resolvedRoot "algentra-copier-master.exe"
 if (-not (Test-Path -LiteralPath $masterPublisher -PathType Leaf)) {
-    throw "Binary publisher Go tidak ditemukan: $masterPublisher. Build dengan go build -o algentra-copier-master.exe ./cmd/copier-master terlebih dahulu."
+    $go = Get-Command go.exe -ErrorAction SilentlyContinue
+    if ((Test-Path -LiteralPath (Join-Path $resolvedRoot 'go.mod') -PathType Leaf) -and $go) {
+        New-Item -ItemType Directory -Path (Join-Path $resolvedRoot 'bin') -Force | Out-Null
+        $masterPublisher = Join-Path $resolvedRoot 'bin\copier-master.exe'
+        Push-Location $resolvedRoot
+        try { & $go.Source build -ldflags='-s -w' -o $masterPublisher ./cmd/copier-master } finally { Pop-Location }
+        if ($LASTEXITCODE -ne 0) { throw 'Build binary copier-master gagal.' }
+    } else {
+        throw "Binary publisher Go tidak ditemukan: $masterPublisher. Paket produksi harus menyertakan bin\copier-master.exe."
+    }
 }
 $createdConfigs = $false
 foreach ($pair in @(
@@ -33,18 +57,6 @@ foreach ($pair in @(
         $createdConfigs = $true
     }
 }
-if ($createdConfigs) {
-    if ([string]::IsNullOrWhiteSpace($ApiBaseUrl)) {
-        $ApiBaseUrl = Read-Host "URL backend API yang dapat dijangkau dari worker"
-    }
-    if ([string]::IsNullOrWhiteSpace($TerminalTemplateDir)) {
-        $TerminalTemplateDir = Read-Host "Path folder template MT5 follower bersih (berisi terminal64.exe)"
-    }
-    if ([string]::IsNullOrWhiteSpace($SignalDirectory)) {
-        $SignalDirectory = Read-Host "Path folder signal yang dibaca publisher"
-    }
-}
-
 try {
     $workerConfig = Get-Content -LiteralPath $workerConfigPath -Raw | ConvertFrom-Json -ErrorAction Stop
 } catch {
@@ -56,8 +68,20 @@ if ([string]$workerConfig.worker_api_key_env -ne "COPIER_WORKER_API_KEY") {
 if (-not [string]::IsNullOrWhiteSpace($ApiBaseUrl)) {
     $workerConfig.api_base_url = $ApiBaseUrl.TrimEnd("/")
 }
-if (-not [string]::IsNullOrWhiteSpace($TerminalTemplateDir)) {
-    $workerConfig.terminal_template_dir = $TerminalTemplateDir
+$prepareFollower = Join-Path $PSScriptRoot 'prepare-managed-follower.ps1'
+$prepareArgs = @{ ProjectRoot = $resolvedRoot }
+if (-not [string]::IsNullOrWhiteSpace($TerminalTemplateDir)) { $prepareArgs.TerminalTemplateDir = $TerminalTemplateDir }
+if (-not [string]::IsNullOrWhiteSpace($MT5SourceTerminalDir)) { $prepareArgs.MT5SourceTerminalDir = $MT5SourceTerminalDir }
+if (-not [string]::IsNullOrWhiteSpace($MasterTerminalPath)) { $prepareArgs.MasterTerminalPath = $MasterTerminalPath }
+$preparedTemplate = & $prepareFollower @prepareArgs | Select-Object -Last 1
+if (-not $preparedTemplate -or -not (Test-Path -LiteralPath (Join-Path $preparedTemplate 'terminal64.exe') -PathType Leaf)) {
+    throw 'Template terminal follower tidak berhasil disiapkan.'
+}
+$workerConfig.terminal_template_dir = $preparedTemplate
+if ($workerConfig.PSObject.Properties.Name -contains 'project_root') {
+    $workerConfig.project_root = $resolvedRoot
+} else {
+    $workerConfig | Add-Member -MemberType NoteProperty -Name 'project_root' -Value $resolvedRoot
 }
 $workerConfig.execution_mode = "mt5_ea"
 $workerConfig.feed_address = "127.0.0.1:8766"
@@ -85,17 +109,16 @@ if (-not [string]::IsNullOrWhiteSpace($SignalDirectory)) {
     $masterConfig.folder_sinyal = $SignalDirectory
 }
 if ([string]::IsNullOrWhiteSpace([string]$masterConfig.folder_sinyal) -or
-    [string]$masterConfig.folder_sinyal -eq "C:/Algentra/signals") {
-    $masterConfig.folder_sinyal = "apps/copier-worker/config/runtime/signals"
+    [string]$masterConfig.folder_sinyal -eq "C:/Algentra/signals" -or
+    [string]$masterConfig.folder_sinyal -eq "apps/copier-worker/config/runtime/signals") {
+    $masterConfig.folder_sinyal = Join-Path $configDirectory 'runtime\signals'
 }
-if ($createdConfigs -or
-    -not [string]::IsNullOrWhiteSpace($ApiBaseUrl) -or
-    -not [string]::IsNullOrWhiteSpace($TerminalTemplateDir)) {
-    $encoding = New-Object System.Text.UTF8Encoding($false)
-    $json = ConvertTo-Json -InputObject $workerConfig -Depth 12
-    [IO.File]::WriteAllText((Join-Path $configDirectory "managed-worker.json"), $json, $encoding)
+if ([string]::IsNullOrWhiteSpace([string]$workerConfig.api_base_url)) {
+    $workerConfig.api_base_url = 'http://127.0.0.1:8000'
 }
 $encoding = New-Object System.Text.UTF8Encoding($false)
+$json = ConvertTo-Json -InputObject $workerConfig -Depth 12
+[IO.File]::WriteAllText((Join-Path $configDirectory "managed-worker.json"), $json, $encoding)
 $json = ConvertTo-Json -InputObject $masterConfig -Depth 12
 [IO.File]::WriteAllText((Join-Path $configDirectory "master.json"), $json, $encoding)
 if ([string]::IsNullOrWhiteSpace([string]$workerConfig.api_base_url)) {
@@ -114,20 +137,6 @@ if (-not (Test-Path -LiteralPath $terminalTemplateDir -PathType Container) -or
     -not (Test-Path -LiteralPath (Join-Path $terminalTemplateDir "terminal64.exe") -PathType Leaf)) {
     throw "terminal_template_dir harus menunjuk folder MT5 follower bersih yang berisi terminal64.exe."
 }
-$probeExpertSource = Join-Path $resolvedRoot "mt5\experts\Algentra\MT5LoginProbe.ex5"
-if (-not (Test-Path -LiteralPath $probeExpertSource -PathType Leaf)) {
-    throw "Expert login probe belum dikompilasi: $probeExpertSource. Compile mt5\experts\Algentra\MT5LoginProbe.mq5 dengan MetaEditor."
-}
-$followerExpertSource = Join-Path $resolvedRoot "mt5\experts\MT5FollowerCopyEA.ex5"
-if (-not (Test-Path -LiteralPath $followerExpertSource -PathType Leaf)) {
-    throw "EA follower belum dikompilasi: $followerExpertSource. Compile mt5\experts\MT5FollowerCopyEA.mq5 dengan MetaEditor."
-}
-$followerExpertTarget = Join-Path $terminalTemplateDir "MQL5\Experts\MT5FollowerCopyEA.ex5"
-New-Item -ItemType Directory -Path (Split-Path -Parent $followerExpertTarget) -Force | Out-Null
-Copy-Item -LiteralPath $followerExpertSource -Destination $followerExpertTarget -Force
-$probeExpertTarget = Join-Path $terminalTemplateDir "MQL5\Experts\Algentra\MT5LoginProbe.ex5"
-New-Item -ItemType Directory -Path (Split-Path -Parent $probeExpertTarget) -Force | Out-Null
-Copy-Item -LiteralPath $probeExpertSource -Destination $probeExpertTarget -Force
 if ([string]$workerConfig.master_source -eq "publisher_ea" -and -not (Test-Path -LiteralPath ([string]$masterConfig.terminal_path) -PathType Leaf)) {
     throw "terminal_path pada master.json harus menunjuk terminal64.exe master yang tersedia."
 }
@@ -148,15 +157,14 @@ if (-not $workerKey) {
     $workerKey = [Environment]::GetEnvironmentVariable("COPIER_WORKER_API_KEY", "Machine")
 }
 if (-not $workerKey) {
-    $secureKey = Read-Host "Masukkan COPIER_WORKER_API_KEY yang sama dengan backend (disimpan pada environment User Windows)" -AsSecureString
-    $keyPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureKey)
-    try {
-        $workerKey = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($keyPointer)
-    } finally {
-        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($keyPointer)
+    foreach ($environmentFile in @((Join-Path $resolvedRoot '.env'), (Join-Path $resolvedRoot '.env.local'))) {
+        if (-not (Test-Path -LiteralPath $environmentFile -PathType Leaf)) { continue }
+        $keyLine = Get-Content -LiteralPath $environmentFile | Where-Object { $_ -match '^\s*COPIER_WORKER_API_KEY\s*=' } | Select-Object -Last 1
+        if ($keyLine) { $workerKey = ($keyLine -replace '^\s*COPIER_WORKER_API_KEY\s*=\s*', '').Trim().Trim('"').Trim("'") }
+        if ($workerKey) { break }
     }
     if (-not $workerKey) {
-        throw "COPIER_WORKER_API_KEY tidak boleh kosong."
+        throw "COPIER_WORKER_API_KEY tidak ditemukan pada environment atau file .env backend."
     }
     [Environment]::SetEnvironmentVariable("COPIER_WORKER_API_KEY", $workerKey, "User")
     $env:COPIER_WORKER_API_KEY = $workerKey
@@ -169,16 +177,10 @@ if (-not $publisherToken) {
     $publisherToken = [Environment]::GetEnvironmentVariable("MASTER_PUBLISHER_TOKEN", "Machine")
 }
 if (-not $publisherToken) {
-    $secureToken = Read-Host "Buat MASTER_PUBLISHER_TOKEN rahasia untuk bridge lokal copier (disimpan pada environment User Windows)" -AsSecureString
-    $tokenPointer = [Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureToken)
-    try {
-        $publisherToken = [Runtime.InteropServices.Marshal]::PtrToStringBSTR($tokenPointer)
-    } finally {
-        [Runtime.InteropServices.Marshal]::ZeroFreeBSTR($tokenPointer)
-    }
-    if (-not $publisherToken) {
-        throw "MASTER_PUBLISHER_TOKEN tidak boleh kosong."
-    }
+    $tokenBytes = [byte[]]::new(32)
+    $rng = [Security.Cryptography.RandomNumberGenerator]::Create()
+    try { $rng.GetBytes($tokenBytes) } finally { $rng.Dispose() }
+    $publisherToken = [BitConverter]::ToString($tokenBytes).Replace('-', '').ToLowerInvariant()
     [Environment]::SetEnvironmentVariable("MASTER_PUBLISHER_TOKEN", $publisherToken, "User")
     $env:MASTER_PUBLISHER_TOKEN = $publisherToken
 }
@@ -225,6 +227,45 @@ $settings = New-ScheduledTaskSettingsSet `
     -ExecutionTimeLimit ([TimeSpan]::Zero) `
     -StartWhenAvailable `
     -MultipleInstances IgnoreNew
+
+# Repairing/reinstalling the worker must replace an already-running instance;
+# otherwise IgnoreNew leaves the old process and its loaded .ex5 files active.
+$existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+if ($existingTask -and $existingTask.State -in @("Running", "StopPending")) {
+    if ($existingTask.State -eq "Running") {
+        Stop-ScheduledTask -TaskName $taskName -ErrorAction Stop
+    }
+    $stopDeadline = [DateTime]::UtcNow.AddSeconds(30)
+    do {
+        Start-Sleep -Milliseconds 500
+        $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    } while ($existingTask -and $existingTask.State -in @("Running", "StopPending") -and [DateTime]::UtcNow -lt $stopDeadline)
+    if ($existingTask -and $existingTask.State -in @("Running", "StopPending")) {
+        throw "Worker lama masih berjalan; task '$taskName' tidak dapat diperbarui dengan aman."
+    }
+}
+
+# Task Scheduler stops the PowerShell launcher, but its native Go child can be
+# orphaned and keep the runtime lock (and managed MT5 terminals) alive. Match
+# both the installed binary path and this runtime's config before stopping its
+# process tree, so other worker installations are left alone.
+$workerBinaryFullPath = [IO.Path]::GetFullPath($workerBinary)
+$workerConfigFullPath = [IO.Path]::GetFullPath($workerConfigPath)
+$workerProcessName = [IO.Path]::GetFileName($workerBinaryFullPath)
+$orphanWorkers = Get-CimInstance Win32_Process -Filter "Name='$workerProcessName'" -ErrorAction Stop |
+    Where-Object {
+        $_.ExecutablePath -and
+        [string]::Equals([IO.Path]::GetFullPath($_.ExecutablePath), $workerBinaryFullPath, [StringComparison]::OrdinalIgnoreCase) -and
+        $_.CommandLine -and $_.CommandLine.Contains($workerConfigFullPath)
+    }
+foreach ($orphan in $orphanWorkers) {
+    Write-Host "Menghentikan proses worker lama PID $($orphan.ProcessId) beserta terminal managed-nya."
+    & (Join-Path $env:SystemRoot 'System32\taskkill.exe') /PID $orphan.ProcessId /T /F | Out-Null
+    if ($LASTEXITCODE -ne 0) {
+        $stillRunning = Get-CimInstance Win32_Process -Filter "ProcessId=$($orphan.ProcessId)" -ErrorAction SilentlyContinue
+        if ($stillRunning) { throw "Worker lama PID $($orphan.ProcessId) tidak dapat dihentikan; task baru tidak dijalankan." }
+    }
+}
 
 Register-ScheduledTask `
     -TaskName $taskName `

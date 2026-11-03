@@ -64,7 +64,9 @@ jobs:
           CGO_ENABLED: "0"
           GOOS: windows
           GOARCH: amd64
-        run: go build -ldflags="-s -w" -o algentra-backend.exe ./cmd/algentra-backend
+        run: |
+          go build -ldflags="-s -w" -o algentra-backend.exe ./cmd/algentra-backend
+          go build -ldflags="-s -w" -o backup-database.exe ./cmd/backup-database
       - name: Build managed copier executables
         env:
           CGO_ENABLED: "0"
@@ -73,13 +75,17 @@ jobs:
         run: |
           go build -ldflags="-s -w" -o algentra-copier-master.exe ./cmd/copier-master
           go build -ldflags="-s -w" -o algentra-copier-launcher.exe ./cmd/copier-launcher
-          go build -ldflags="-s -w" -o algentra-mt5-login-probe.exe ./cmd/mt5-login-probe
           go build -ldflags="-s -w" -o algentra-copier-worker.exe ./cmd/copier-worker
       - name: Upload Windows executable
         uses: actions/upload-artifact@v4
         with:
           name: algentra-backend-windows-amd64
-          path: algentra-backend.exe
+          path: |
+            algentra-backend.exe
+            backup-database.exe
+            algentra-copier-master.exe
+            algentra-copier-launcher.exe
+            algentra-copier-worker.exe
           if-no-files-found: error
           retention-days: 7
 

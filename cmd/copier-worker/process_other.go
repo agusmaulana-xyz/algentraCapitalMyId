@@ -8,7 +8,9 @@ import (
 	"time"
 )
 
-func prepareChild(cmd *exec.Cmd) {}
+func prepareChild(cmd *exec.Cmd)                                                    {}
+func manageMT5Charts(processID uint32, stopped <-chan struct{}, enforceSingle bool) {}
+func requestMT5Close(processID uint32)                                              {}
 
 func stopChildProcess(cmd *exec.Cmd, done <-chan error, timeout time.Duration) error {
 	select {

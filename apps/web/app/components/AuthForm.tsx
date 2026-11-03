@@ -50,7 +50,7 @@ async function post(
   const token = readCsrfToken();
   if (token) headers["X-CSRF-Token"] = token;
   try {
-    const response = await fetch(`/api/core/${path}`, {
+    const response = await fetch(`/api/${path}`, {
       method: "POST",
       headers,
       body: JSON.stringify(body),

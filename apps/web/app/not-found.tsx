@@ -10,7 +10,7 @@ export const metadata: Metadata = {
 /**
  * Halaman 404 — dibungkus SiteFrame (header, navigasi, tombol tema, footer) seperti halaman
  * lain, memakai token warna UI saat ini (--action biru, --accent emas, panel kaca) dan
- * maskot robot Algentra. Versi Jinja: legacy-jinja-templates/404.html (CSS & SVG identik).
+ * maskot robot Algentra.
  */
 export default function NotFound() {
   return (

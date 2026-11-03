@@ -15,7 +15,7 @@ import {
   type Tone,
 } from "../lib/format";
 
-type Stats = Record<string, number | string | boolean | string[] | null | undefined>;
+type Stats = Record<string, number | string | boolean | string[] | null | undefined> & { trades_closed?: number };
 type Mt5Live = {
   online: boolean;
   available: boolean;
@@ -52,6 +52,7 @@ type Signal = {
 type GroupStat = {
   group_name: string;
   signals_total: number;
+  trades_closed?: number;
   wins: number;
   losses: number;
   winrate: number;
@@ -75,8 +76,21 @@ type MasterDailyProfit = { date: string; profit: number; currency?: string | nul
 const EMPTY = "—";
 const TRADE_PAGE_SIZE = 10;
 
-const displayTime = (value?: string | null) =>
-  value ? new Date(value).toLocaleString("id-ID", { timeZone: "Asia/Jakarta" }) : EMPTY;
+const displayTime = (value?: string | null) => {
+  if (!value) return EMPTY;
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return EMPTY;
+  return new Intl.DateTimeFormat("id-ID", {
+    timeZone: "Asia/Jakarta",
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hourCycle: "h23",
+  }).format(date);
+};
 
 const displayQuoteTime = (value: number | string | null | undefined) => {
   const milliseconds = Number(value);
@@ -136,6 +150,8 @@ export function DashboardPanel() {
   const [logs, setLogs] = useState<LogEntry[]>([]);
   const [trades, setTrades] = useState<Trade[]>([]);
   const [profitTrades, setProfitTrades] = useState<Trade[]>([]);
+  const [tradesError, setTradesError] = useState("");
+  const [profitChartError, setProfitChartError] = useState("");
   const [tradePage, setTradePage] = useState(0);
   const [hasMoreTrades, setHasMoreTrades] = useState(false);
   const [registrationOpen, setRegistrationOpenState] = useState<boolean | null>(null);
@@ -143,6 +159,9 @@ export function DashboardPanel() {
   const [registrationBusy, setRegistrationBusy] = useState(false);
   const [settingsMessage, setSettingsMessage] = useState("");
   const [geminiMessage, setGeminiMessage] = useState("");
+  const [eaApiKey, setEaApiKey] = useState<string | null>(null);
+  const [eaApiKeyVisible, setEaApiKeyVisible] = useState(false);
+  const [eaApiKeyMessage, setEaApiKeyMessage] = useState("");
   const [connection, setConnection] = useState("Menghubungkan realtime…");
   const [logLevel, setLogLevel] = useState("");
   const [logSearch, setLogSearch] = useState("");
@@ -167,6 +186,8 @@ export function DashboardPanel() {
   const groupCanvasRef = useRef<HTMLCanvasElement>(null);
   const profitCanvasRef = useRef<HTMLCanvasElement>(null);
   const latestSignalIdRef = useRef<number | null | undefined>(undefined);
+  const hasGroupOutcomes = groups.some((group) => group.wins + group.losses > 0);
+  const hasClosedProfitTrades = profitTrades.some((trade) => Boolean(trade.closed_at));
 
   async function loadStatsAndSignals() {
     const [freshStats, freshSignals] = await Promise.all([
@@ -212,15 +233,27 @@ export function DashboardPanel() {
       limit: String(TRADE_PAGE_SIZE + 1),
       offset: String(safePage * TRADE_PAGE_SIZE),
     };
-    const rows = await apiRequest<Trade[]>(queryWithFilters("dashboard/trades", values));
-    setHasMoreTrades(rows.length > TRADE_PAGE_SIZE);
-    setTrades(rows.slice(0, TRADE_PAGE_SIZE));
-    setTradePage(safePage);
-    tradePageRef.current = safePage;
+    try {
+      const rows = await apiRequest<Trade[]>(queryWithFilters("dashboard/trades", values));
+      setHasMoreTrades(rows.length > TRADE_PAGE_SIZE);
+      setTrades(rows.slice(0, TRADE_PAGE_SIZE));
+      setTradePage(safePage);
+      tradePageRef.current = safePage;
+      setTradesError("");
+    } catch (error) {
+      setTradesError(error instanceof Error ? error.message : "Riwayat trade gagal dimuat.");
+      throw error;
+    }
   }
 
   async function loadProfitChart() {
-    setProfitTrades(await apiRequest<Trade[]>("dashboard/trades?limit=30"));
+    try {
+      setProfitTrades(await apiRequest<Trade[]>("dashboard/trades?limit=30"));
+      setProfitChartError("");
+    } catch (error) {
+      setProfitChartError(error instanceof Error ? error.message : "Grafik profit gagal dimuat.");
+      throw error;
+    }
   }
 
   async function loadSettings() {
@@ -273,7 +306,7 @@ export function DashboardPanel() {
       if (!cancelled)
         setSettingsMessage(reason instanceof Error ? reason.message : "Gagal memuat settings.");
     });
-    const stream = new EventSource("/api/core/dashboard/realtime/stream");
+    const stream = new EventSource("/api/dashboard/realtime/stream");
     // --- Realtime: SSE + refresh detail terpicu perubahan + watchdog fallback ---
     let lastSseAt = Date.now();
     let lastSignature = "";
@@ -377,14 +410,14 @@ export function DashboardPanel() {
 
   useEffect(() => {
     if (!chartReady) return;
-    const canvas = groupCanvasRef.current;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const ChartLib = (window as any).Chart;
-    if (!canvas || !ChartLib) return;
     if (groupChartRef.current) {
       groupChartRef.current.destroy();
       groupChartRef.current = null;
     }
+    const canvas = groupCanvasRef.current;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ChartLib = (window as any).Chart;
+    if (!canvas || !ChartLib || !hasGroupOutcomes) return;
     const labels = groups.map((g) => g.group_name);
     const data = {
       labels,
@@ -447,18 +480,18 @@ export function DashboardPanel() {
       groupChartRef.current?.destroy();
       groupChartRef.current = null;
     };
-  }, [groups, chartReady]);
+  }, [groups, chartReady, hasGroupOutcomes]);
 
   useEffect(() => {
     if (!chartReady) return;
-    const canvas = profitCanvasRef.current;
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const ChartLib = (window as any).Chart;
-    if (!canvas || !ChartLib) return;
     if (profitChartRef.current) {
       profitChartRef.current.destroy();
       profitChartRef.current = null;
     }
+    const canvas = profitCanvasRef.current;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const ChartLib = (window as any).Chart;
+    if (!canvas || !ChartLib || !hasClosedProfitTrades) return;
     const closed = profitTrades
       .filter((t) => t.closed_at)
       .sort((a, b) => new Date(a.closed_at as string).getTime() - new Date(b.closed_at as string).getTime());
@@ -502,7 +535,7 @@ export function DashboardPanel() {
       profitChartRef.current?.destroy();
       profitChartRef.current = null;
     };
-  }, [profitTrades, chartReady]);
+  }, [profitTrades, chartReady, hasClosedProfitTrades]);
 
   async function setRegistrationOpen(isOpen: boolean) {
     setRegistrationBusy(true);
@@ -559,12 +592,36 @@ export function DashboardPanel() {
     }
   }
 
+  async function revealEaApiKey() {
+    setEaApiKeyMessage("");
+    try {
+      const result = await apiRequest<{ configured: boolean; api_key: string }>("settings/ea-api-key");
+      setEaApiKey(result.configured ? result.api_key : "");
+      setEaApiKeyVisible(true);
+      if (!result.configured) setEaApiKeyMessage("EA_API_KEY belum dikonfigurasi pada layanan backend.");
+    } catch (reason) {
+      setEaApiKeyMessage(reason instanceof Error ? reason.message : "EA_API_KEY tidak dapat dimuat.");
+    }
+  }
+
+  async function copyEaApiKey() {
+    if (!eaApiKey) return;
+    try {
+      await navigator.clipboard.writeText(eaApiKey);
+      setEaApiKeyMessage("EA_API_KEY disalin.");
+    } catch {
+      setEaApiKeyMessage("Gagal menyalin. Pilih dan salin key secara manual.");
+    }
+  }
+
   // ---- Turunan tampilan dari state (cermin applyStats di template asli) ----
   const signalInt = (key: string) =>
     stats && stats[key] != null ? formatInteger(stats[key] as number) : EMPTY;
   const wins = stats?.wins != null ? num(stats.wins) : null;
   const losses = stats?.losses != null ? num(stats.losses) : null;
   const winrate = stats?.winrate != null ? num(stats.winrate) : null;
+  const closedTradeCount = stats?.trades_closed != null ? num(stats.trades_closed) : null;
+  const hasWinLossResults = wins !== null && losses !== null && wins + losses > 0;
   const totalProfit = stats?.total_profit != null ? num(stats.total_profit) : null;
   const dailyLoss = stats?.daily_loss != null && Number.isFinite(num(stats.daily_loss)) ? num(stats.daily_loss) : null;
 
@@ -623,7 +680,7 @@ export function DashboardPanel() {
   const geminiTitle =
     typeof stats?.gemini_model === "string" && stats.gemini_model ? stats.gemini_model : "Model parser aktif";
 
-  const logsExportHref = `/api/core/${queryWithFilters("dashboard/logs/export.csv", {
+  const logsExportHref = `/api/${queryWithFilters("dashboard/logs/export.csv", {
     level: logLevel,
     search: logSearch,
   })}`;
@@ -634,7 +691,7 @@ export function DashboardPanel() {
     symbol: tradeFilters.symbol,
     result: tradeFilters.result,
   };
-  const tradesExportHref = `/api/core/${queryWithFilters("dashboard/trades/export.csv", tradeExportValues)}`;
+  const tradesExportHref = `/api/${queryWithFilters("dashboard/trades/export.csv", tradeExportValues)}`;
 
   return (
     <>
@@ -729,22 +786,22 @@ export function DashboardPanel() {
             <div className="sc-block sc-performance">
               <div className="sc-profit">
                 <div className="sc-profit-label">
-                  <span>TOTAL PROFIT</span>
+                  <span>PROFIT TEREALISASI</span>
                 </div>
                 <b id="total-profit" className={toneClass(totalProfit !== null ? numberTone(totalProfit) : "")}>
-                  {totalProfit !== null ? formatNumber(totalProfit, 2, 2) : EMPTY}
+                  {totalProfit !== null && (closedTradeCount === null || closedTradeCount > 0) ? formatNumber(totalProfit, 2, 2) : EMPTY}
                 </b>
               </div>
               <div className="sc-metrics">
                 <div>
                   <b id="winrate" className={toneClass(winrate !== null ? (winrate >= 50 ? "pos" : "warn") : "")}>
-                    {winrate !== null ? formatPercent(winrate) : EMPTY}
+                    {winrate !== null && hasWinLossResults ? formatPercent(winrate) : EMPTY}
                   </b>
                   <span>Winrate</span>
                 </div>
                 <div>
                   <b id="wins-losses-inline">
-                    {wins !== null && losses !== null ? (
+                    {wins !== null && losses !== null && hasWinLossResults ? (
                       <>
                         <span>{formatInteger(wins)}</span>
                         {" / "}
@@ -1022,7 +1079,11 @@ export function DashboardPanel() {
           <section>
             <h2>Win dan loss per grup</h2>
             <p className="section-help">Bandingkan akurasi dan profit dari setiap grup sumber.</p>
-            <canvas id="group-chart" height={180} ref={groupCanvasRef}></canvas>
+            {hasGroupOutcomes ? (
+              <canvas id="group-chart" height={180} ref={groupCanvasRef}></canvas>
+            ) : (
+              <p className="dashboard-chart-empty">Grafik win/loss akan terisi setelah ada trade yang ditutup.</p>
+            )}
             <div className="table-wrap">
               <table>
                 <thead>
@@ -1040,10 +1101,10 @@ export function DashboardPanel() {
                     <tr key={group.group_name}>
                       <td>{group.group_name}</td>
                       <td className="num">{formatInteger(group.signals_total)}</td>
-                      <td className="num">{formatInteger(group.wins)}</td>
-                      <td className="num">{formatInteger(group.losses)}</td>
-                      <td className="num">{formatPercent(group.winrate)}</td>
-                      <td className="num">{formatNumber(group.profit, 2, 2)}</td>
+                      <td className="num">{group.wins + group.losses > 0 ? formatInteger(group.wins) : EMPTY}</td>
+                      <td className="num">{group.wins + group.losses > 0 ? formatInteger(group.losses) : EMPTY}</td>
+                      <td className="num">{group.wins + group.losses > 0 ? formatPercent(group.winrate) : EMPTY}</td>
+                      <td className="num">{(group.trades_closed ?? 0) > 0 ? formatNumber(group.profit, 2, 2) : EMPTY}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -1053,7 +1114,11 @@ export function DashboardPanel() {
           <section>
             <h2>Profit kumulatif</h2>
             <p className="section-help">Perubahan profit terealisasi dari waktu ke waktu.</p>
-            <canvas id="profit-chart" height={220} ref={profitCanvasRef}></canvas>
+            {hasClosedProfitTrades ? (
+              <canvas id="profit-chart" height={220} ref={profitCanvasRef}></canvas>
+            ) : (
+              <p className={`dashboard-chart-empty${profitChartError ? " tone-neg" : ""}`}>{profitChartError ? `Grafik gagal dimuat: ${profitChartError}` : "Grafik akan terisi setelah ada trade yang ditutup."}</p>
+            )}
           </section>
         </div>
 
@@ -1160,6 +1225,7 @@ export function DashboardPanel() {
               Export CSV
             </a>
           </div>
+          {tradesError && <p className="status tone-neg" role="alert">Riwayat trade gagal dimuat: {tradesError}</p>}
           <div className="table-wrap">
             <table>
               <thead>
@@ -1199,6 +1265,9 @@ export function DashboardPanel() {
                     </td>
                   </tr>
                 ))}
+                {!trades.length && (
+                  <tr><td className="empty-cell" colSpan={9}>{tradesError ? "Data trade belum dapat ditampilkan." : "Belum ada trade yang cocok dengan filter."}</td></tr>
+                )}
               </tbody>
             </table>
           </div>
@@ -1229,15 +1298,32 @@ export function DashboardPanel() {
           <span className="eyebrow">Risk &amp; configuration</span>
           <h2>Settings</h2>
           <p className="section-help">
-            Memengaruhi validasi sinyal dan guard backend. Trading berjalan live; gunakan kill switch untuk
-            menjeda distribusi sinyal. API key Gemini dan Telegram dikelola lewat environment layanan.
+            Pengaturan validasi sinyal dan guard backend. Gunakan kill switch untuk menjeda distribusi sinyal.
           </p>
+          <div className="settings-block" id="ea-api-key-setting">
+            <h3>EA_API_KEY</h3>
+            <p className="section-help">Dipakai EA master untuk mengirim sinyal ke server.</p>
+            <div className="settings-action">
+              <button type="button" onClick={() => {
+                if (eaApiKeyVisible) {
+                  setEaApiKeyVisible(false);
+                  setEaApiKey(null);
+                  setEaApiKeyMessage("");
+                }
+                else void revealEaApiKey();
+              }}>
+                {eaApiKeyVisible ? "Sembunyikan" : "Tampilkan key"}
+              </button>
+              {eaApiKeyVisible && eaApiKey && <button type="button" className="secondary" onClick={() => void copyEaApiKey()}>Salin</button>}
+            </div>
+            {eaApiKeyVisible && eaApiKey && <pre className="ea-api-key-value">{eaApiKey}</pre>}
+            {eaApiKeyMessage && <p className="status" role="status">{eaApiKeyMessage}</p>}
+          </div>
           <form id="gemini-form" className="settings-block" onSubmit={(event) => void submitGemini(event)}>
             <h3>Parser Gemini</h3>
             <div className="settings-row">
               <label>
-                Model
-                <small className="field-help">ID model yang menangani klasifikasi dan ekstraksi signal.</small>
+                Model Gemini
                 <input
                   id="gemini-model-input"
                   placeholder="gemini-3.8-flash"
