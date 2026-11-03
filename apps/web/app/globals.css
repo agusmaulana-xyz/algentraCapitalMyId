@@ -1547,6 +1547,9 @@
 .ea-params__manual { display: grid; gap: 10px; }
 .ea-params__row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) auto; gap: 8px; align-items: center; }
 .ea-params button, .ea-params__back { min-height: 38px; padding: 6px 14px; font-size: 13px; }
+.ea-params__import { position: relative; display: inline-flex; justify-self: start; align-items: center; min-height: 38px; padding: 6px 14px; overflow: hidden; cursor: pointer; }
+.ea-params__import input { position: absolute; inset: 0; width: 100%; height: 100%; margin: 0; opacity: 0; cursor: pointer; }
+.ea-params__import:focus-within { outline: 2px solid var(--action); outline-offset: 2px; }
 .ea-params__add { justify-self: start; }
 .ea-params__actions { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding-top: 14px; border-top: 1px solid var(--line); }
 .ea-params__back { display: inline-flex; align-items: center; margin-left: auto; color: var(--link, var(--action)); text-decoration: none; }

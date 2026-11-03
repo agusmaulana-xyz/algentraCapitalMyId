@@ -14,6 +14,22 @@ type ParamsResponse = {
 
 type Row = { name: string; value: string };
 
+function parseSetPreset(text: string): Row[] {
+  const rows: Row[] = [];
+  const seen = new Set<string>();
+  for (const line of text.replace(/^\uFEFF/, "").split(/\r?\n/)) {
+    const separator = line.indexOf("=");
+    if (separator < 1) continue;
+    const name = line.slice(0, separator).trim();
+    if (!/^[A-Za-z_][A-Za-z0-9_]{0,63}$/.test(name) || seen.has(name)) continue;
+    const value = (line.slice(separator + 1).split("||", 1)[0] ?? "").trim();
+    if (value.length > 256 || rows.length >= 200) continue;
+    seen.add(name);
+    rows.push({ name, value });
+  }
+  return rows;
+}
+
 export function CustomEAParamsPanel({ accountId }: { accountId: string }) {
   const [data, setData] = useState<ParamsResponse | null>(null);
   const [values, setValues] = useState<Record<string, string>>({});
@@ -71,6 +87,33 @@ export function CustomEAParamsPanel({ accountId }: { accountId: string }) {
     }
   };
 
+  const importPreset = async (event: React.ChangeEvent<HTMLInputElement>) => {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = "";
+    if (!file) return;
+    if (file.size > 256 * 1024) {
+      setMessage("File .set terlalu besar (maksimum 256 KB).");
+      return;
+    }
+    try {
+      const bytes = new Uint8Array(await file.arrayBuffer());
+      let text: string;
+      if (bytes[0] === 0xff && bytes[1] === 0xfe) text = new TextDecoder("utf-16le").decode(bytes.subarray(2));
+      else if (bytes[0] === 0xfe && bytes[1] === 0xff) text = new TextDecoder("utf-16be").decode(bytes.subarray(2));
+      else if (bytes.length > 3 && bytes[1] === 0 && bytes[3] === 0) text = new TextDecoder("utf-16le").decode(bytes);
+      else text = new TextDecoder("utf-8").decode(bytes);
+      const imported = parseSetPreset(text);
+      if (!imported.length) {
+        setMessage("Tidak ada parameter yang terbaca. Simpan file .set dari tab Inputs EA di MT5 lalu coba lagi.");
+        return;
+      }
+      setRows(imported);
+      setMessage(`${imported.length} parameter berhasil dimuat dari ${file.name}. Tekan Simpan parameter untuk menerapkannya.`);
+    } catch {
+      setMessage("File .set tidak dapat dibaca.");
+    }
+  };
+
   return (
     <main className="page-shell dashboard-page account-page" id="main-content" tabIndex={-1}>
     <section className="panel section ea-params">
@@ -107,7 +150,11 @@ export function CustomEAParamsPanel({ accountId }: { accountId: string }) {
       )}
       {data?.free_form && (
         <div className="ea-params__manual">
-          <p className="muted">Daftar parameter belum terdeteksi. Server membacanya otomatis dari terminal saat EA dijeda (sekitar 1–2 menit setelah upload); muat ulang halaman ini nanti. Anda juga bisa mengisi nama dan nilai secara manual.</p>
+          <p className="muted">Daftar input EA belum terdeteksi otomatis. Di MT5, buka properti EA pada chart, pilih tab Inputs, lalu klik Save untuk membuat file .set. Impor file itu di sini agar semua nama dan nilai parameter dimuat sekaligus.</p>
+          <label className="secondary ea-params__import">
+            Impor parameter dari file .set
+            <input type="file" accept=".set,text/plain" onChange={(event) => void importPreset(event)} />
+          </label>
           {rows.map((row, index) => (
             <div className="ea-params__row" key={index}>
               <input aria-label="Nama parameter" placeholder="NamaParameter" maxLength={64} value={row.name} onChange={(event) => { const name = event.currentTarget.value; setRows((current) => current.map((item, i) => (i === index ? { ...item, name } : item))); }} />
