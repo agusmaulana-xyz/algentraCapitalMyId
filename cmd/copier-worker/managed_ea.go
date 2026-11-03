@@ -83,7 +83,7 @@ func compileLogFinished(logPath string) bool {
 	return strings.Contains(text, "Result:")
 }
 
-func (w *worker) prepareManagedEA(j job, token, terminalDir, name string) error {
+func (w *worker) prepareManagedEA(j job, token, terminalDir, name string, reportOnly bool) error {
 	source := filepath.Join(w.cfg.projectRoot, "mt5", "experts", "MT5FollowerCopyEA.ex5")
 	if err := copyFile(source, filepath.Join(terminalDir, "MQL5", "Experts", "MT5FollowerCopyEA.ex5")); err != nil {
 		return fmt.Errorf("binary MT5FollowerCopyEA.ex5 tidak dapat dipasang; compile mt5/experts/MT5FollowerCopyEA.mq5: %w", err)
@@ -140,6 +140,7 @@ func (w *worker) prepareManagedEA(j job, token, terminalDir, name string) error 
 		fmt.Sprintf("MaxLotTotal=%.8f||%.8f||0.01||1000.0||N", j.MaxLotTotal, j.MaxLotTotal),
 		fmt.Sprintf("MaxOpenPositions=%d||%d||1||1000||N", j.MaxOpenPositions, j.MaxOpenPositions),
 		"ReverseDirection=false||false||false||true||N",
+		fmt.Sprintf("DryRun=%t||false||false||true||N", reportOnly),
 	}
 	if strings.ContainsAny(j.FollowerSymbol, "\r\n,=") {
 		return fmt.Errorf("simbol follower akun %d tidak valid untuk input EA", j.AccountID)
