@@ -15,6 +15,8 @@ import (
 
 const discoverRetryDelay = 10 * time.Minute
 
+const maxCaptureAttempts = 2
+
 type discoveredInput struct {
 	Name    string `json:"name"`
 	Type    string `json:"type"`
@@ -131,6 +133,48 @@ wait:
 	log.Printf("daftar parameter EA akun %d terbaca: %d input", j.AccountID, len(inputs))
 }
 
+// captureRunningInputs reads the input list of a running custom EA. MT5 only
+// writes the chart profile on a normal close, so the terminal is closed once;
+// the supervisor loop starts it again on the next sync. It reports whether
+// the terminal was stopped. Attempts are capped because every attempt costs a
+// restart of the client's EA.
+func (w *worker) captureRunningInputs(j job, c *child) bool {
+	w.checkMu.Lock()
+	attempts := w.captureAttempts[j.AccountID]
+	w.checkMu.Unlock()
+	if attempts >= maxCaptureAttempts || time.Since(c.startedAt) < 90*time.Second {
+		return false
+	}
+	w.checkMu.Lock()
+	w.captureAttempts[j.AccountID] = attempts + 1
+	w.checkMu.Unlock()
+
+	requestMT5Close(uint32(c.cmd.Process.Pid))
+	select {
+	case <-c.stopped:
+	case <-time.After(25 * time.Second):
+		_ = stopChildProcess(c.cmd, c.done, 10*time.Second)
+	}
+	delete(w.children, j.AccountID)
+	if c.log != nil {
+		_ = c.log.Close()
+	}
+	accountDir := filepath.Join(w.cfg.runtimeDir, "terminals", fmt.Sprint(j.AccountID))
+	inputs, ok := readChartInputs(accountDir)
+	clearSavedCharts(accountDir)
+	if !ok {
+		log.Printf("daftar parameter EA akun %d belum terbaca dari terminal yang berjalan (percobaan %d)", j.AccountID, attempts+1)
+		return true
+	}
+	var ignored any
+	if err := w.request(fmt.Sprintf("/api/mt5/copier/accounts/%d/custom-ea/inputs", j.AccountID), map[string]any{"inputs": inputs}, &ignored); err != nil {
+		log.Printf("daftar parameter EA akun %d gagal dikirim: %v", j.AccountID, err)
+		return true
+	}
+	log.Printf("daftar parameter EA akun %d terbaca dari terminal yang berjalan: %d input", j.AccountID, len(inputs))
+	return true
+}
+
 // readChartInputs parses the saved chart profile written by MT5 and returns
 // the inputs of the attached expert.
 func readChartInputs(accountDir string) ([]discoveredInput, bool) {
@@ -158,9 +202,24 @@ func decodeChartFile(data []byte) string {
 }
 
 func parseChartInputs(text string) ([]discoveredInput, bool) {
-	inExpert, inInputs, found := false, false, false
+	inExpert, inInputs, found, sawInputs := false, false, false, false
 	inputs := make([]discoveredInput, 0)
+	// Some builds store expert inputs directly after the header keys, as
+	// indicators do, instead of inside an <inputs> section.
+	loose := make([]discoveredInput, 0)
 	seen := map[string]struct{}{}
+	add := func(list *[]discoveredInput, line string) {
+		name, value, ok := strings.Cut(line, "=")
+		// Lines such as "Lots,F=0" hold optimizer metadata, not an input.
+		if !ok || !chartInputName.MatchString(name) || len(*list) >= 200 || len(value) > 256 {
+			return
+		}
+		if _, duplicate := seen[name]; duplicate {
+			return
+		}
+		seen[name] = struct{}{}
+		*list = append(*list, discoveredInput{Name: name, Type: guessInputType(value), Default: value})
+	}
 	for _, line := range strings.Split(text, "\n") {
 		line = strings.TrimSpace(line)
 		switch line {
@@ -168,29 +227,33 @@ func parseChartInputs(text string) ([]discoveredInput, bool) {
 			inExpert, found = true, true
 			continue
 		case "</expert>":
-			return inputs, found
+			if sawInputs {
+				return inputs, found
+			}
+			return loose, found
 		case "<inputs>":
-			inInputs = inExpert
+			inInputs, sawInputs = inExpert, inExpert
 			continue
 		case "</inputs>":
 			inInputs = false
 			continue
 		}
-		if !inInputs {
-			continue
+		switch {
+		case inInputs:
+			add(&inputs, line)
+		case inExpert && !strings.HasPrefix(line, "<"):
+			if name, _, ok := strings.Cut(line, "="); ok && !chartHeaderKeys[name] {
+				add(&loose, line)
+			}
 		}
-		name, value, ok := strings.Cut(line, "=")
-		// Lines such as "Lots,F=0" hold optimizer metadata, not an input.
-		if !ok || !chartInputName.MatchString(name) || len(inputs) >= 200 || len(value) > 256 {
-			continue
-		}
-		if _, duplicate := seen[name]; duplicate {
-			continue
-		}
-		seen[name] = struct{}{}
-		inputs = append(inputs, discoveredInput{Name: name, Type: guessInputType(value), Default: value})
 	}
 	return inputs, found
+}
+
+var chartHeaderKeys = map[string]bool{
+	"name": true, "path": true, "expertmode": true, "fixed_height": true, "apply": true, "show_data": true,
+	"scale_inherit": true, "scale_line": true, "scale_line_percent": true, "scale_line_value": true,
+	"scale_fix_min": true, "scale_fix_min_val": true, "scale_fix_max": true, "scale_fix_max_val": true,
 }
 
 func guessInputType(value string) string {
