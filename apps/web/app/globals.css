@@ -1545,6 +1545,8 @@
 .ea-params__name small { color: var(--muted); font-size: 11px; font-weight: 500; }
 .ea-params__field input, .ea-params__row input { width: 100%; max-width: none; min-height: 40px; margin: 0; font-size: 14px; }
 .ea-params__manual { display: grid; gap: 10px; }
+.ea-params__fallback { display: grid; gap: 10px; }
+.ea-params__fallback summary { width: fit-content; color: var(--muted); font-size: 12px; cursor: pointer; }
 .ea-params__row { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1.4fr) auto; gap: 8px; align-items: center; }
 .ea-params button, .ea-params__back { min-height: 38px; padding: 6px 14px; font-size: 13px; }
 .ea-params__import { position: relative; display: inline-flex; justify-self: start; align-items: center; min-height: 38px; padding: 6px 14px; overflow: hidden; cursor: pointer; }
