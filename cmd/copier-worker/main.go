@@ -94,6 +94,8 @@ type worker struct {
 	cfg           config
 	client        *http.Client
 	children      map[int64]*child
+	reporters     map[int64]*child
+	reporterRetry map[int64]time.Time
 	retryAt       map[int64]time.Time
 	failures      map[int64]int
 	master        *exec.Cmd
@@ -260,6 +262,7 @@ func newWorker(cfg config) (*worker, error) {
 	transport.MaxConnsPerHost = 128
 	return &worker{
 		cfg: cfg, client: &http.Client{Timeout: 20 * time.Second, Transport: transport}, children: map[int64]*child{},
+		reporters: map[int64]*child{}, reporterRetry: map[int64]time.Time{},
 		retryAt: map[int64]time.Time{}, failures: map[int64]int{}, stop: make(chan struct{}), checking: map[int64]bool{},
 		masterBinary: findMasterPublisher(cfg.projectRoot),
 		feed:         feed,
@@ -415,17 +418,39 @@ func (w *worker) cleanEnvironment(includeMasterToken bool) []string {
 	return allowed
 }
 
+// terminalDirName is the runtime terminal folder for an account. Custom-EA
+// accounts get a second, report-only terminal so balance and history still
+// reach the portal while the uploaded EA owns the main terminal.
+func terminalDirName(id int64, reporter bool) string {
+	if reporter {
+		return fmt.Sprintf("%d%s", id, reporterDirSuffix)
+	}
+	return fmt.Sprint(id)
+}
+
 func (w *worker) startJob(j job, now time.Time) error {
-	configPath, heartbeat, token, err := w.makeJobConfig(j)
+	return w.launch(j, now, false)
+}
+
+func (w *worker) startReporter(j job, now time.Time) error {
+	return w.launch(j, now, true)
+}
+
+func (w *worker) launch(j job, now time.Time, reporter bool) error {
+	configPath, heartbeat, token, err := w.makeJobConfig(j, reporter)
 	if err != nil {
 		return err
 	}
-	logFile, err := os.OpenFile(filepath.Join(w.cfg.runtimeDir, "logs", fmt.Sprintf("managed_%d.log", j.AccountID)), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
+	logName := fmt.Sprintf("managed_%d.log", j.AccountID)
+	if reporter {
+		logName = fmt.Sprintf("managed_%d_report.log", j.AccountID)
+	}
+	logFile, err := os.OpenFile(filepath.Join(w.cfg.runtimeDir, "logs", logName), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 	if err != nil {
 		w.feed.Unregister(j.AccountID)
 		return err
 	}
-	cmd := exec.Command(filepath.Join(w.cfg.runtimeDir, "terminals", fmt.Sprint(j.AccountID), "terminal64.exe"), "/portable", "/config:"+configPath)
+	cmd := exec.Command(filepath.Join(w.cfg.runtimeDir, "terminals", terminalDirName(j.AccountID, reporter), "terminal64.exe"), "/portable", "/config:"+configPath)
 	cmd.Dir = filepath.Dir(cmd.Path)
 	cmd.Env = w.cleanEnvironment(false)
 	prepareChild(cmd)
@@ -436,33 +461,41 @@ func (w *worker) startJob(j job, now time.Time) error {
 		return err
 	}
 	executor := "mt5_ea"
-	if strings.EqualFold(j.EAMode, "CUSTOM") {
+	if reporter {
+		executor = "mt5_reporter"
+	} else if strings.EqualFold(j.EAMode, "CUSTOM") {
 		executor = "custom_ea"
 	}
 	c := &child{accountID: j.AccountID, fingerprint: fingerprint(j), cmd: cmd, done: make(chan error, 1), stopped: make(chan struct{}), log: logFile, heartbeat: heartbeat, startedAt: now, executor: executor, feedToken: token, startupINI: configPath}
-	w.children[j.AccountID] = c
+	if reporter {
+		w.reporters[j.AccountID] = c
+	} else {
+		w.children[j.AccountID] = c
+	}
 	go func() {
 		c.done <- cmd.Wait()
 		close(c.stopped)
 	}()
 	go manageMT5Charts(uint32(cmd.Process.Pid), c.stopped, true)
-	if c.executor == "mt5_ea" {
+	if c.executor == "mt5_ea" || reporter {
 		go w.serveManagedFileBridge(c)
 		go w.watchReport(c)
 	}
-	_ = w.report(j.AccountID, "STARTING", "")
+	if !reporter {
+		_ = w.report(j.AccountID, "STARTING", "")
+	}
 	log.Printf("follower managed akun %d (%s) dimulai pid=%d", j.AccountID, executor, cmd.Process.Pid)
 	go w.removeStartupConfigAfterLaunch(c)
 	return nil
 }
 
-func (w *worker) makeJobConfig(j job) (string, string, string, error) {
+func (w *worker) makeJobConfig(j job, reporter bool) (string, string, string, error) {
 	if j.AccountID <= 0 || j.BrokerPassword == "" || j.Login == "" || j.Server == "" {
 		return "", "", "", errors.New("data akun follower tidak lengkap")
 	}
 	var token string
 	var err error
-	customEA := strings.EqualFold(j.EAMode, "CUSTOM")
+	customEA := strings.EqualFold(j.EAMode, "CUSTOM") && !reporter
 	if !customEA {
 		token, err = newFeedToken()
 		if err != nil {
@@ -470,7 +503,10 @@ func (w *worker) makeJobConfig(j job) (string, string, string, error) {
 		}
 	}
 	name := fmt.Sprintf("managed_%d", j.AccountID)
-	accountDir := filepath.Join(w.cfg.runtimeDir, "terminals", fmt.Sprint(j.AccountID))
+	if reporter {
+		name += "_report"
+	}
+	accountDir := filepath.Join(w.cfg.runtimeDir, "terminals", terminalDirName(j.AccountID, reporter))
 	terminal := filepath.Join(accountDir, "terminal64.exe")
 	w.killTerminalsIn(accountDir)
 	if _, err := os.Stat(terminal); err != nil {
@@ -523,7 +559,7 @@ func (w *worker) makeJobConfig(j job) (string, string, string, error) {
 			return "", "", "", errors.New("format EA custom harus .mq5 atau .ex5")
 		}
 		expertName, presetName = "AlgentraCustom\\CustomEA", ""
-	} else if err := w.prepareManagedEA(j, token, accountDir, name); err != nil {
+	} else if err := w.prepareManagedEA(j, token, accountDir, name, reporter); err != nil {
 		w.feed.Unregister(j.AccountID)
 		return "", "", "", err
 	}
@@ -557,6 +593,8 @@ func (w *worker) download(endpoint string) ([]byte, error) {
 }
 
 const terminalInUseMessage = "File terminal MT5 sedang dipakai proses lain. Tutup terminal MT5 untuk akun ini lalu coba simpan kredensial lagi."
+
+const reporterDirSuffix = "-report"
 
 func (w *worker) syncOnce() error {
 	if err := w.startMaster(); err != nil {
@@ -619,7 +657,7 @@ func (w *worker) syncOnce() error {
 	}
 	if entries, err := os.ReadDir(filepath.Join(w.cfg.runtimeDir, "terminals")); err == nil {
 		for _, entry := range entries {
-			id, parseErr := parsePositive(entry.Name())
+			id, parseErr := parsePositive(strings.TrimSuffix(entry.Name(), reporterDirSuffix))
 			if entry.IsDir() && parseErr == nil {
 				if _, ok := managed[id]; !ok && !w.isChecking(id) {
 					if err := w.removeOrphan(id); err != nil {
@@ -672,6 +710,7 @@ func (w *worker) syncOnce() error {
 			}
 			w.failures[id] = 0
 			_ = w.report(id, "RUNNING", "EA kustom berjalan pada terminal sewa.")
+			w.ensureReporter(j)
 			continue
 		}
 		info, err := os.Stat(current.heartbeat)
@@ -807,6 +846,7 @@ func (w *worker) report(id int64, status, message string) error {
 }
 
 func (w *worker) stopChild(id int64, report bool) {
+	w.stopReporter(id)
 	c := w.children[id]
 	if c == nil {
 		return
@@ -854,7 +894,65 @@ func (w *worker) shutdown() {
 	log.Printf("managed copier Go supervisor berhenti")
 }
 
+// ensureReporter keeps a report-only terminal (DryRun follower EA, never
+// trades) alive next to a custom-EA terminal, so the portal keeps receiving
+// balance, equity and deal history for the account.
+func (w *worker) ensureReporter(j job) {
+	if c := w.reporters[j.AccountID]; c != nil {
+		select {
+		case err := <-c.done:
+			delete(w.reporters, j.AccountID)
+			w.feed.Unregister(j.AccountID)
+			if c.log != nil {
+				_ = c.log.Close()
+			}
+			w.reporterRetry[j.AccountID] = time.Now().Add(15 * time.Second)
+			log.Printf("terminal laporan akun %d berhenti: %v", j.AccountID, err)
+		default:
+			return
+		}
+	}
+	if time.Now().Before(w.reporterRetry[j.AccountID]) {
+		return
+	}
+	if err := w.startReporter(j, time.Now()); err != nil {
+		w.reporterRetry[j.AccountID] = time.Now().Add(30 * time.Second)
+		log.Printf("terminal laporan akun %d gagal disiapkan: %v", j.AccountID, err)
+	}
+}
+
+func (w *worker) stopReporter(id int64) {
+	c := w.reporters[id]
+	if c == nil {
+		return
+	}
+	delete(w.reporters, id)
+	delete(w.reporterRetry, id)
+	w.feed.Unregister(id)
+	if c.startupINI != "" {
+		defer os.Remove(c.startupINI)
+	}
+	select {
+	case <-c.done:
+	default:
+		_ = stopChildProcess(c.cmd, c.done, 10*time.Second)
+	}
+	if c.log != nil {
+		_ = c.log.Close()
+	}
+}
+
+func (w *worker) removeTerminalDir(name string) error {
+	root := filepath.Join(w.cfg.runtimeDir, "terminals")
+	dir := filepath.Join(root, name)
+	if err := removeWithin(root, dir); err != nil {
+		return err
+	}
+	return os.RemoveAll(dir)
+}
+
 func (w *worker) removeOrphan(id int64) error {
+	_ = w.removeTerminalDir(terminalDirName(id, true))
 	dir := filepath.Join(w.cfg.runtimeDir, "terminals", fmt.Sprint(id))
 	if err := removeWithin(filepath.Join(w.cfg.runtimeDir, "terminals"), dir); err != nil {
 		return err
