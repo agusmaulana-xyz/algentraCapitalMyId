@@ -33,11 +33,27 @@ function Get-ServiceFailureDetails([string]$Name) {
   $parts=[Collections.Generic.List[string]]::new()
   $service=Get-Service $Name -ErrorAction SilentlyContinue
   if($service){$parts.Add("status=$($service.Status)")}
-  foreach($suffix in @('err.log','out.log')){
-    $log=Join-Path (Join-Path $InstallDir "logs\$(@{AlgentraCoreApi='core-api';AlgentraWeb='web';AlgentraTunnel='tunnel'}[$Name])") "$Name.$suffix"
-    if(Test-Path -LiteralPath $log){$tail=Get-Content -LiteralPath $log -Tail 30 -ErrorAction SilentlyContinue;if($tail){$parts.Add("${suffix}:`n$($tail -join "`n")")}}
+  $logDirectory=Join-Path $InstallDir "logs\$(@{AlgentraCoreApi='core-api';AlgentraWeb='web';AlgentraTunnel='tunnel'}[$Name])"
+  $logNames=@("$Name.err.log","$Name.out.log")
+  if($Name -eq 'AlgentraTunnel'){$logNames+='cloudflared.log'}
+  foreach($logName in $logNames){
+    $log=Join-Path $logDirectory $logName
+    if(Test-Path -LiteralPath $log){$tail=Get-Content -LiteralPath $log -Tail 30 -ErrorAction SilentlyContinue;if($tail){$parts.Add("${logName}:`n$($tail -join "`n")")}}
+  }
+  if($Name -eq 'AlgentraTunnel' -and (Test-Path -LiteralPath $Nssm)){
+    $previousErrorActionPreference=$ErrorActionPreference
+    try{$ErrorActionPreference='Continue';foreach($setting in @('Application','AppParameters','AppDirectory','ObjectName')){$value=@(& $Nssm get $Name $setting 2>&1);if($LASTEXITCODE -eq 0){$parts.Add("NSSM $setting=$($value -join ' ') ")}}}finally{$ErrorActionPreference=$previousErrorActionPreference}
   }
   return ($parts -join "`n")
+}
+function Assert-CloudflareTunnelToken([string]$Value) {
+  $encoded=$Value.Trim()
+  $parts=$encoded.Split('.')
+  if($parts.Count -gt 1){$encoded=$parts[1]}
+  $encoded=$encoded.Replace('-','+').Replace('_','/')
+  switch($encoded.Length % 4){2{$encoded+='=='}3{$encoded+='='}1{throw 'Format token Cloudflare Tunnel tidak valid.'}}
+  try{$claims=[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encoded))|ConvertFrom-Json -ErrorAction Stop}catch{throw 'Token yang dimasukkan bukan token connector Cloudflare Tunnel yang valid.'}
+  if(-not $claims.a -or -not $claims.t -or -not $claims.s){throw 'Token yang dimasukkan bukan token connector Cloudflare Tunnel. Gunakan token tunnel dari Cloudflare Zero Trust.'}
 }
 function Start-AlgentraServices([string[]]$Names=@('AlgentraCoreApi','AlgentraWeb','AlgentraTunnel')) {
   foreach($name in $Names){
@@ -319,12 +335,14 @@ if($RepairCloudflare -or $RepairWeb -or $RepairCoreApi){
     try{
       $tunnelToken=[Runtime.InteropServices.Marshal]::PtrToStringBSTR($tokenPointer).Trim()
       if(-not $tunnelToken){throw 'Token Cloudflare Tunnel tidak boleh kosong.'}
+      Assert-CloudflareTunnelToken $tunnelToken
       New-Item -ItemType Directory -Path $SecretsDir -Force|Out-Null
       Set-Content -LiteralPath $TunnelTokenFile -Value $tunnelToken -NoNewline -Encoding ascii
     }finally{[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($tokenPointer)}
     Ensure-CloudflaredBinary
     Assert-CloudflaredSupportsTokenFile
-    Install-Service 'AlgentraTunnel' (Join-Path $BinDir 'cloudflared.exe') "tunnel run --token-file `"$TunnelTokenFile`"" $BinDir (Join-Path $InstallDir 'logs\tunnel')
+    $tunnelLogFile=Join-Path $InstallDir 'logs\tunnel\cloudflared.log'
+    Install-Service 'AlgentraTunnel' (Join-Path $BinDir 'cloudflared.exe') "tunnel --loglevel info --logfile `"$tunnelLogFile`" run --token-file `"$TunnelTokenFile`"" $BinDir (Join-Path $InstallDir 'logs\tunnel')
     Set-TunnelTokenAcl
     $selected+='AlgentraTunnel'
   }
@@ -368,7 +386,8 @@ if($Repair){
   if(-not(Test-Path -LiteralPath $TunnelTokenFile -PathType Leaf) -and $v.CLOUDFLARE_TUNNEL_TOKEN){New-Item -ItemType Directory -Path $SecretsDir -Force|Out-Null;Set-Content -LiteralPath $TunnelTokenFile -Value $v.CLOUDFLARE_TUNNEL_TOKEN.Trim() -NoNewline -Encoding ascii;Set-TunnelTokenAcl;$envContent=@(Get-Content -LiteralPath $EnvFile|Where-Object{$_ -notmatch '^\s*CLOUDFLARE_TUNNEL_TOKEN='});Set-Content -LiteralPath $EnvFile -Value $envContent -Encoding utf8}
   if(-not(Test-Path -LiteralPath $TunnelTokenFile -PathType Leaf)){throw 'Token tunnel belum dibuat. Jalankan instalasi awal dengan CLOUDFLARE_API_TOKEN.'}
   Assert-CloudflaredSupportsTokenFile
-  Install-Service 'AlgentraTunnel' (Join-Path $BinDir 'cloudflared.exe') "tunnel run --token-file `"$TunnelTokenFile`"" $BinDir (Join-Path $InstallDir 'logs\tunnel')
+  $tunnelLogFile=Join-Path $InstallDir 'logs\tunnel\cloudflared.log'
+  Install-Service 'AlgentraTunnel' (Join-Path $BinDir 'cloudflared.exe') "tunnel --loglevel info --logfile `"$tunnelLogFile`" run --token-file `"$TunnelTokenFile`"" $BinDir (Join-Path $InstallDir 'logs\tunnel')
   Set-TunnelTokenAcl
   Set-EnvAcl;Register-AlgentraTasks;Start-AlgentraServices
   $null=Invoke-RestMethod 'http://127.0.0.1:8000/ready' -TimeoutSec 45
@@ -433,7 +452,8 @@ if(-not(Test-Path "$next")){throw 'node_modules Next.js tidak ditemukan dalam we
 $node=Join-Path $webDir 'node.exe';if(-not(Test-Path $node)){$node=(Get-Command node.exe -ErrorAction SilentlyContinue).Source};if(-not $node){throw 'Bundel node.exe atau Node.js runtime diperlukan untuk menjalankan next start.'}
 Install-Service 'AlgentraCoreApi' 'powershell.exe' "-NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $InstallDir 'infra\windows\start-core-api.ps1')`" -ProjectRoot `"$InstallDir`" -EnvironmentFile `"$EnvFile`"" $InstallDir (Join-Path $InstallDir 'logs\core-api')
 Install-Service 'AlgentraWeb' $node "`"$next`" start -p 3000" $webDir (Join-Path $InstallDir 'logs\web')
-Install-Service 'AlgentraTunnel' (Join-Path $BinDir 'cloudflared.exe') "tunnel run --token-file `"$TunnelTokenFile`"" $BinDir (Join-Path $InstallDir 'logs\tunnel')
+$tunnelLogFile=Join-Path $InstallDir 'logs\tunnel\cloudflared.log'
+Install-Service 'AlgentraTunnel' (Join-Path $BinDir 'cloudflared.exe') "tunnel --loglevel info --logfile `"$tunnelLogFile`" run --token-file `"$TunnelTokenFile`"" $BinDir (Join-Path $InstallDir 'logs\tunnel')
 Set-TunnelTokenAcl
 Set-EnvAcl
 Start-AlgentraServices
