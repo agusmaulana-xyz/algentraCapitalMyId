@@ -26,7 +26,8 @@ function Assert-Admin {
   if (-not ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Jalankan install.ps1 dari PowerShell Administrator.' }
 }
 function Stop-AlgentraServices {
-  foreach ($name in @('AlgentraTunnel','AlgentraWeb','AlgentraCoreApi')) { if (Get-Service $name -ErrorAction SilentlyContinue) { & $Nssm stop $name 2>&1 | Out-Null } }
+  $previousErrorActionPreference=$ErrorActionPreference
+  try{$ErrorActionPreference='Continue';foreach ($name in @('AlgentraTunnel','AlgentraWeb','AlgentraCoreApi')) { if (Get-Service $name -ErrorAction SilentlyContinue) { & $Nssm stop $name 2>&1 | Out-Null } }}finally{$ErrorActionPreference=$previousErrorActionPreference}
 }
 function Get-ServiceFailureDetails([string]$Name) {
   $parts=[Collections.Generic.List[string]]::new()
@@ -43,8 +44,8 @@ function Start-AlgentraServices([string[]]$Names=@('AlgentraCoreApi','AlgentraWe
     $service=Get-Service $name -ErrorAction SilentlyContinue
     if(-not $service){throw "Windows service $name tidak terdaftar."}
     if($service.Status -ne 'Running'){
-      $startOutput=& $Nssm start $name 2>&1
-      $startExit=$LASTEXITCODE
+      $previousErrorActionPreference=$ErrorActionPreference
+      try{$ErrorActionPreference='Continue';$startOutput=@(& $Nssm start $name 2>&1);$startExit=$LASTEXITCODE}finally{$ErrorActionPreference=$previousErrorActionPreference}
       $deadline=(Get-Date).AddSeconds(20)
       do{
         Start-Sleep -Milliseconds 500
@@ -252,7 +253,7 @@ function Validate-Env {
   }
 }
 function Install-Service($name,$app,$appArgs,$workingDir,$logDir) {
-  if(Get-Service $name -ErrorAction SilentlyContinue){& $Nssm stop $name | Out-Null;& $Nssm remove $name confirm | Out-Null}
+  if(Get-Service $name -ErrorAction SilentlyContinue){$previousErrorActionPreference=$ErrorActionPreference;try{$ErrorActionPreference='Continue';& $Nssm stop $name 2>&1 | Out-Null;& $Nssm remove $name confirm 2>&1 | Out-Null}finally{$ErrorActionPreference=$previousErrorActionPreference}}
   & $Nssm install $name $app $appArgs | Out-Null
   Enable-ServiceSid $name
   & $Nssm set $name AppDirectory $workingDir | Out-Null
