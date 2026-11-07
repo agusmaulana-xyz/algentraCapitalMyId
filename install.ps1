@@ -96,8 +96,20 @@ function Set-EnvAcl {
 }
 function Set-TunnelTokenAcl {
   $serviceSid=Get-ServiceSid 'AlgentraTunnel'
-  & icacls $TunnelTokenFile /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' ('*'+$serviceSid+':(R)') | Out-Null
+  & icacls $TunnelTokenFile /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' ('*'+$serviceSid+':(R)') '*S-1-5-19:(R)' | Out-Null
   if($LASTEXITCODE -ne 0){throw 'Gagal mengatur ACL token Cloudflare Tunnel.'}
+  $aclTargets=@(
+    @{Path=$InstallDir;Grant='*S-1-5-19:(X)';Recursive=$false},
+    @{Path=$BinDir;Grant='*S-1-5-19:(OI)(CI)RX';Recursive=$true},
+    @{Path=$SecretsDir;Grant='*S-1-5-19:(RX)';Recursive=$false},
+    @{Path=(Join-Path $InstallDir 'logs\tunnel');Grant='*S-1-5-19:(OI)(CI)M';Recursive=$true}
+  )
+  foreach($target in $aclTargets){
+    $arguments=@($target.Path,'/grant',$target.Grant)
+    if($target.Recursive){$arguments+=@('/T','/C')}
+    & icacls @arguments | Out-Null
+    if($LASTEXITCODE -ne 0){throw "Gagal memberi akses LocalService pada $($target.Path)."}
+  }
 }
 function Assert-CloudflaredSupportsTokenFile {
   $cloudflared=Join-Path $BinDir 'cloudflared.exe'
