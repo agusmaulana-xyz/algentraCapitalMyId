@@ -48,6 +48,7 @@ function Get-ServiceFailureDetails([string]$Name) {
 }
 function Assert-CloudflareTunnelToken([string]$Value) {
   $encoded=$Value.Trim()
+  if($encoded -match '^(?i:cfut_|cfat_|cfk_)'){throw 'Token yang dimasukkan adalah kredensial API Cloudflare, bukan token connector Tunnel. Untuk -RepairCloudflare, gunakan token tunnel berawalan eyJ dari perintah Add a replica di Cloudflare Zero Trust.'}
   $parts=$encoded.Split('.')
   if($parts.Count -gt 1){$encoded=$parts[1]}
   $encoded=$encoded.Replace('-','+').Replace('_','/')
