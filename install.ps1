@@ -1,6 +1,9 @@
 ﻿param(
     [string] $InstallDir = 'C:\AppServer',
     [switch] $Repair,
+    [switch] $RepairCloudflare,
+    [switch] $RepairWeb,
+    [Alias('RepairApiCore')][switch] $RepairCoreApi,
     [string] $Update,
     [switch] $Uninstall,
     [switch] $PurgeData
@@ -23,7 +26,37 @@ function Assert-Admin {
   if (-not ([Security.Principal.WindowsPrincipal]$identity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Jalankan install.ps1 dari PowerShell Administrator.' }
 }
 function Stop-AlgentraServices {
-  foreach ($name in @('AlgentraTunnel','AlgentraWeb','AlgentraCoreApi')) { if (Get-Service $name -ErrorAction SilentlyContinue) { & $Nssm stop $name | Out-Null } }
+  foreach ($name in @('AlgentraTunnel','AlgentraWeb','AlgentraCoreApi')) { if (Get-Service $name -ErrorAction SilentlyContinue) { & $Nssm stop $name 2>&1 | Out-Null } }
+}
+function Get-ServiceFailureDetails([string]$Name) {
+  $parts=[Collections.Generic.List[string]]::new()
+  $service=Get-Service $Name -ErrorAction SilentlyContinue
+  if($service){$parts.Add("status=$($service.Status)")}
+  foreach($suffix in @('err.log','out.log')){
+    $log=Join-Path (Join-Path $InstallDir "logs\$(@{AlgentraCoreApi='core-api';AlgentraWeb='web';AlgentraTunnel='tunnel'}[$Name])") "$Name.$suffix"
+    if(Test-Path -LiteralPath $log){$tail=Get-Content -LiteralPath $log -Tail 30 -ErrorAction SilentlyContinue;if($tail){$parts.Add("${suffix}:`n$($tail -join "`n")")}}
+  }
+  return ($parts -join "`n")
+}
+function Start-AlgentraServices([string[]]$Names=@('AlgentraCoreApi','AlgentraWeb','AlgentraTunnel')) {
+  foreach($name in $Names){
+    $service=Get-Service $name -ErrorAction SilentlyContinue
+    if(-not $service){throw "Windows service $name tidak terdaftar."}
+    if($service.Status -ne 'Running'){
+      $startOutput=& $Nssm start $name 2>&1
+      $startExit=$LASTEXITCODE
+      $deadline=(Get-Date).AddSeconds(20)
+      do{
+        Start-Sleep -Milliseconds 500
+        $service=Get-Service $name -ErrorAction SilentlyContinue
+        if($service -and $service.Status -eq 'Running'){break}
+      }while((Get-Date) -lt $deadline)
+      if($startExit -ne 0 -or -not $service -or $service.Status -ne 'Running'){
+        $details=Get-ServiceFailureDetails $name
+        throw "Gagal menjalankan $name (NSSM exit $startExit). $($startOutput -join ' ')`n$details"
+      }
+    }
+  }
 }
 function Enable-ServiceSid([string]$Name) {
   & "$env:windir\System32\sc.exe" sidtype $Name unrestricted | Out-Null
@@ -255,6 +288,54 @@ function Install-ManagedWorkerTask {
 
 Assert-Admin
 if($Uninstall){if(Test-Path $Nssm){Stop-AlgentraServices;foreach($n in @('AlgentraCoreApi','AlgentraWeb','AlgentraTunnel')){if(Get-Service $n -ErrorAction SilentlyContinue){& $Nssm remove $n confirm|Out-Null}}};Get-ScheduledTask -ErrorAction SilentlyContinue|Where-Object{$_.TaskName -like 'Algentra*'}|Unregister-ScheduledTask -Confirm:$false -ErrorAction SilentlyContinue;if($PurgeData){$confirm=Read-Host "Ketik PURGE untuk menghapus data dan secret dari $InstallDir";if($confirm -eq 'PURGE'){Remove-Item -LiteralPath $DataDir -Recurse -Force -ErrorAction SilentlyContinue;Remove-Item -LiteralPath $EnvFile -Force -ErrorAction SilentlyContinue;Remove-Item -LiteralPath $TunnelTokenFile -Force -ErrorAction SilentlyContinue}};exit 0}
+if($RepairCloudflare -or $RepairWeb -or $RepairCoreApi){
+  if($Repair){throw 'Gunakan -Repair penuh atau switch repair terpisah dalam satu pemanggilan, jangan keduanya.'}
+  if(-not(Test-Path -LiteralPath $EnvFile -PathType Leaf)){throw ".env tidak ditemukan: $EnvFile"}
+  Ensure-NssmBinary
+  $v=Read-Env
+  $selected=@()
+  foreach($log in @('core-api','web','tunnel')){New-Item -ItemType Directory -Force -Path (Join-Path $InstallDir "logs\$log")|Out-Null}
+  if($RepairCoreApi){
+    $apiScript=Join-Path $InstallDir 'infra\windows\start-core-api.ps1'
+    if(-not(Test-Path -LiteralPath $apiScript -PathType Leaf)){throw "Startup Core API tidak ditemukan: $apiScript"}
+    Install-Service 'AlgentraCoreApi' 'powershell.exe' "-NoProfile -ExecutionPolicy Bypass -File `"$apiScript`" -ProjectRoot `"$InstallDir`" -EnvironmentFile `"$EnvFile`"" $InstallDir (Join-Path $InstallDir 'logs\core-api')
+    Set-EnvAcl
+    $selected+='AlgentraCoreApi'
+  }
+  if($RepairWeb){
+    $webDir=Join-Path $InstallDir 'web'
+    $next=Join-Path $webDir 'node_modules\next\dist\bin\next'
+    $node=Join-Path $webDir 'node.exe'
+    if(-not(Test-Path -LiteralPath $node)){$node=(Get-Command node.exe -ErrorAction SilentlyContinue).Source}
+    if(-not $node -or -not(Test-Path -LiteralPath $next)){throw 'Web build atau Node.js tidak ditemukan; jalankan -Repair penuh untuk membangun ulang web.'}
+    Install-Service 'AlgentraWeb' $node "`"$next`" start -p 3000" $webDir (Join-Path $InstallDir 'logs\web')
+    $selected+='AlgentraWeb'
+  }
+  if($RepairCloudflare){
+    $secureTunnelToken=Read-Host 'Masukkan ulang token Cloudflare Tunnel' -AsSecureString
+    if($secureTunnelToken.Length -eq 0){throw 'Token Cloudflare Tunnel tidak boleh kosong.'}
+    $tokenPointer=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureTunnelToken)
+    try{
+      $tunnelToken=[Runtime.InteropServices.Marshal]::PtrToStringBSTR($tokenPointer).Trim()
+      if(-not $tunnelToken){throw 'Token Cloudflare Tunnel tidak boleh kosong.'}
+      New-Item -ItemType Directory -Path $SecretsDir -Force|Out-Null
+      Set-Content -LiteralPath $TunnelTokenFile -Value $tunnelToken -NoNewline -Encoding ascii
+    }finally{[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($tokenPointer)}
+    Ensure-CloudflaredBinary
+    Assert-CloudflaredSupportsTokenFile
+    Install-Service 'AlgentraTunnel' (Join-Path $BinDir 'cloudflared.exe') "tunnel run --token-file `"$TunnelTokenFile`"" $BinDir (Join-Path $InstallDir 'logs\tunnel')
+    Set-TunnelTokenAcl
+    $selected+='AlgentraTunnel'
+  }
+  Start-AlgentraServices $selected
+  if($RepairCoreApi){$null=Invoke-RestMethod 'http://127.0.0.1:8000/ready' -TimeoutSec 45;Write-Host 'Core API berhasil diperbaiki dan siap.'}
+  if($RepairWeb){$null=Invoke-WebRequest 'http://127.0.0.1:3000/' -UseBasicParsing -TimeoutSec 30;Write-Host 'Web berhasil diperbaiki dan siap.'}
+  if($RepairCloudflare){
+    try{$null=Invoke-WebRequest "https://$($v.PUBLIC_DOMAIN)/" -UseBasicParsing -TimeoutSec 30;Write-Host "Cloudflare Tunnel aktif untuk $($v.PUBLIC_DOMAIN)."}
+    catch{$tunnelDetails=Get-ServiceFailureDetails 'AlgentraTunnel';Write-Warning "Service tunnel berjalan tetapi domain publik belum merespons. Log tunnel:`n$tunnelDetails`nPenyebab pemeriksaan publik: $_"}
+  }
+  exit 0
+}
 if($Repair){
   if(-not(Test-Path $EnvFile)){throw '.env tidak ditemukan'}
   Ensure-NssmBinary;Ensure-CloudflaredBinary
@@ -288,7 +369,7 @@ if($Repair){
   Assert-CloudflaredSupportsTokenFile
   Install-Service 'AlgentraTunnel' (Join-Path $BinDir 'cloudflared.exe') "tunnel run --token-file `"$TunnelTokenFile`"" $BinDir (Join-Path $InstallDir 'logs\tunnel')
   Set-TunnelTokenAcl
-  Set-EnvAcl;Register-AlgentraTasks;foreach($service in @('AlgentraCoreApi','AlgentraWeb','AlgentraTunnel')){if((Get-Service $service).Status -ne 'Running'){& $Nssm start $service|Out-Null}}
+  Set-EnvAcl;Register-AlgentraTasks;Start-AlgentraServices
   $null=Invoke-RestMethod 'http://127.0.0.1:8000/ready' -TimeoutSec 45
   Install-ManagedWorkerTask
   Write-Host 'ACL, service NSSM, dan task backup/watchdog diperiksa.';exit 0
@@ -354,12 +435,12 @@ Install-Service 'AlgentraWeb' $node "`"$next`" start -p 3000" $webDir (Join-Path
 Install-Service 'AlgentraTunnel' (Join-Path $BinDir 'cloudflared.exe') "tunnel run --token-file `"$TunnelTokenFile`"" $BinDir (Join-Path $InstallDir 'logs\tunnel')
 Set-TunnelTokenAcl
 Set-EnvAcl
-foreach($name in @('AlgentraCoreApi','AlgentraWeb','AlgentraTunnel')){& $Nssm start $name|Out-Null;Start-Sleep -Seconds 2}
+Start-AlgentraServices
 Write-InstallLog 'Service Core API, web, dan tunnel telah dimulai.'
 Register-AlgentraTasks;if(-not $v.TELEGRAM_BOT_TOKEN -or -not $v.TELEGRAM_ADMIN_CHAT_ID){Write-Warning 'Backup dan watchdog Telegram belum dijadwalkan; lengkapi konfigurasi bot lalu jalankan install.ps1 -Repair.'}
 try{$ready=Invoke-RestMethod 'http://127.0.0.1:8000/ready' -TimeoutSec 30;$web=Invoke-WebRequest 'http://127.0.0.1:3000' -UseBasicParsing -TimeoutSec 30;if($ready.status -ne 'ready' -or $web.StatusCode -ne 200){throw 'Smoke check service gagal'}}catch{throw "Service terpasang tetapi verifikasi gagal: $_"}
 Install-ManagedWorkerTask
-try{$public=Invoke-WebRequest "https://$($v.PUBLIC_DOMAIN)/" -UseBasicParsing -TimeoutSec 30;if($public.StatusCode -ne 200){Write-Warning "Domain publik menjawab HTTP $($public.StatusCode); periksa aturan Cloudflare Tunnel."}}catch{Write-Warning "Domain publik belum menjawab; periksa Public Hostname Cloudflare: $_"}
+try{$public=Invoke-WebRequest "https://$($v.PUBLIC_DOMAIN)/" -UseBasicParsing -TimeoutSec 30;if($public.StatusCode -ne 200){$tunnelDetails=Get-ServiceFailureDetails 'AlgentraTunnel';Write-Warning "Domain publik menjawab HTTP $($public.StatusCode); log AlgentraTunnel:`n$tunnelDetails"}}catch{$tunnelDetails=Get-ServiceFailureDetails 'AlgentraTunnel';Write-Warning "Domain publik belum menjawab; log AlgentraTunnel:`n$tunnelDetails`nPenyebab pemeriksaan publik: $_"}
 Write-Host "Instalasi Algentra siap di $InstallDir. Domain: https://$($v.PUBLIC_DOMAIN)"
 Write-InstallLog 'Pemeriksaan lokal selesai; domain publik harus dilihat pada output instalasi.'
 
