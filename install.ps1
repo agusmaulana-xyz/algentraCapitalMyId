@@ -98,17 +98,19 @@ function Set-TunnelTokenAcl {
   $serviceSid=Get-ServiceSid 'AlgentraTunnel'
   & icacls $TunnelTokenFile /inheritance:r /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' ('*'+$serviceSid+':(R)') '*S-1-5-19:(R)' | Out-Null
   if($LASTEXITCODE -ne 0){throw 'Gagal mengatur ACL token Cloudflare Tunnel.'}
+  $cloudflared=Join-Path $BinDir 'cloudflared.exe'
   $aclTargets=@(
-    @{Path=$InstallDir;Grant='*S-1-5-19:(X)';Recursive=$false},
-    @{Path=$BinDir;Grant='*S-1-5-19:(OI)(CI)RX';Recursive=$true},
-    @{Path=$SecretsDir;Grant='*S-1-5-19:(RX)';Recursive=$false},
-    @{Path=(Join-Path $InstallDir 'logs\tunnel');Grant='*S-1-5-19:(OI)(CI)M';Recursive=$true}
+    @{Path=$InstallDir;Grants=@('*S-1-5-19:(X)',('*'+$serviceSid+':(X)'));Recursive=$false},
+    @{Path=$BinDir;Grants=@('*S-1-5-19:(RX)',('*'+$serviceSid+':(RX)'));Recursive=$false},
+    @{Path=$cloudflared;Grants=@('*S-1-5-19:(RX)',('*'+$serviceSid+':(RX)'));Recursive=$false},
+    @{Path=$SecretsDir;Grants=@('*S-1-5-19:(RX)',('*'+$serviceSid+':(RX)'));Recursive=$false},
+    @{Path=(Join-Path $InstallDir 'logs\tunnel');Grants=@('*S-1-5-19:(OI)(CI)M',('*'+$serviceSid+':(OI)(CI)M'));Recursive=$true}
   )
   foreach($target in $aclTargets){
-    $arguments=@($target.Path,'/grant',$target.Grant)
+    $arguments=@($target.Path,'/grant')+$target.Grants
     if($target.Recursive){$arguments+=@('/T','/C')}
     & icacls @arguments | Out-Null
-    if($LASTEXITCODE -ne 0){throw "Gagal memberi akses LocalService pada $($target.Path)."}
+    if($LASTEXITCODE -ne 0){throw "Gagal memberi akses service AlgentraTunnel pada $($target.Path)."}
   }
 }
 function Assert-CloudflaredSupportsTokenFile {
