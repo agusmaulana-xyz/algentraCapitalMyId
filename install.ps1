@@ -348,7 +348,7 @@ if($RepairCloudflare -or $RepairWeb -or $RepairCoreApi){
       Set-Content -LiteralPath $TunnelTokenFile -Value ([string]$cloudflareResult.tunnel_token) -NoNewline -Encoding ascii
     }finally{[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($tokenPointer);Remove-Variable apiToken -ErrorAction SilentlyContinue;$secureApiToken.Dispose()}
     $tunnelLogFile=Join-Path $InstallDir 'logs\tunnel\cloudflared.log'
-    Install-Service 'AlgentraTunnel' (Join-Path $BinDir 'cloudflared.exe') "tunnel --loglevel info --logfile `"$tunnelLogFile`" run --token-file `"$TunnelTokenFile`"" $BinDir (Join-Path $InstallDir 'logs\tunnel')
+    Install-Service 'AlgentraTunnel' (Join-Path $BinDir 'cloudflared.exe') "tunnel --protocol http2 --loglevel info --logfile `"$tunnelLogFile`" run --token-file `"$TunnelTokenFile`"" $BinDir (Join-Path $InstallDir 'logs\tunnel')
     Set-TunnelTokenAcl
     $selected+='AlgentraTunnel'
   }
@@ -393,7 +393,7 @@ if($Repair){
   if(-not(Test-Path -LiteralPath $TunnelTokenFile -PathType Leaf)){throw 'Token tunnel belum dibuat. Jalankan instalasi awal dengan CLOUDFLARE_API_TOKEN.'}
   Assert-CloudflaredSupportsTokenFile
   $tunnelLogFile=Join-Path $InstallDir 'logs\tunnel\cloudflared.log'
-  Install-Service 'AlgentraTunnel' (Join-Path $BinDir 'cloudflared.exe') "tunnel --loglevel info --logfile `"$tunnelLogFile`" run --token-file `"$TunnelTokenFile`"" $BinDir (Join-Path $InstallDir 'logs\tunnel')
+  Install-Service 'AlgentraTunnel' (Join-Path $BinDir 'cloudflared.exe') "tunnel --protocol http2 --loglevel info --logfile `"$tunnelLogFile`" run --token-file `"$TunnelTokenFile`"" $BinDir (Join-Path $InstallDir 'logs\tunnel')
   Set-TunnelTokenAcl
   Set-EnvAcl;Register-AlgentraTasks;Start-AlgentraServices
   $null=Invoke-RestMethod 'http://127.0.0.1:8000/ready' -TimeoutSec 45
@@ -459,7 +459,7 @@ $node=Join-Path $webDir 'node.exe';if(-not(Test-Path $node)){$node=(Get-Command 
 Install-Service 'AlgentraCoreApi' 'powershell.exe' "-NoProfile -ExecutionPolicy Bypass -File `"$(Join-Path $InstallDir 'infra\windows\start-core-api.ps1')`" -ProjectRoot `"$InstallDir`" -EnvironmentFile `"$EnvFile`"" $InstallDir (Join-Path $InstallDir 'logs\core-api')
 Install-Service 'AlgentraWeb' $node "`"$next`" start -p 3000" $webDir (Join-Path $InstallDir 'logs\web')
 $tunnelLogFile=Join-Path $InstallDir 'logs\tunnel\cloudflared.log'
-Install-Service 'AlgentraTunnel' (Join-Path $BinDir 'cloudflared.exe') "tunnel --loglevel info --logfile `"$tunnelLogFile`" run --token-file `"$TunnelTokenFile`"" $BinDir (Join-Path $InstallDir 'logs\tunnel')
+Install-Service 'AlgentraTunnel' (Join-Path $BinDir 'cloudflared.exe') "tunnel --protocol http2 --loglevel info --logfile `"$tunnelLogFile`" run --token-file `"$TunnelTokenFile`"" $BinDir (Join-Path $InstallDir 'logs\tunnel')
 Set-TunnelTokenAcl
 Set-EnvAcl
 Start-AlgentraServices
