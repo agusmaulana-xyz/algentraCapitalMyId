@@ -52,6 +52,16 @@ Setelah mengubah source, jalankan mode repair dari PowerShell Administrator. Rep
 .\install.ps1 -InstallDir C:\AppServer -Repair
 ```
 
+Untuk memperbaiki satu service saja, gunakan salah satu switch berikut. Repair terpisah memasang ulang konfigurasi service dan memulai service itu; web dan binary Core API harus sudah tersedia di instalasi. `-RepairCloudflare` meminta token Cloudflare Tunnel baru secara tersembunyi, lalu memperbaiki service tunnel. Masukkan token connector tunnel dari Cloudflare Zero Trust; konfigurasi tunnel dan DNS di dashboard Cloudflare tidak diubah.
+
+```powershell
+.\install.ps1 -InstallDir C:\AppServer -RepairCloudflare
+.\install.ps1 -InstallDir C:\AppServer -RepairWeb
+.\install.ps1 -InstallDir C:\AppServer -RepairCoreApi
+```
+
+Switch repair terpisah dapat digabungkan untuk memperbaiki beberapa service sekaligus. `-RepairApiCore` juga tersedia sebagai alias untuk `-RepairCoreApi`.
+
 ### Uninstall
 
 `uninstall.ps1` menghapus service NSSM, Scheduled Task, proses dari folder instalasi, environment variable worker (`COPIER_WORKER_API_KEY`, `MASTER_PUBLISHER_TOKEN`), file sementara, dan folder instalasi. Skrip meminta konfirmasi `HAPUS`. MT5 di Program Files serta tunnel/DNS Cloudflare tidak ikut dihapus.
