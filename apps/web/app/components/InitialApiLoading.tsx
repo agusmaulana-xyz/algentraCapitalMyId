@@ -42,10 +42,10 @@ export function InitialApiLoading() {
   return (
     <div className="app-loading app-loading--overlay" role="status" aria-live="polite" aria-label="Memuat data terbaru">
       <div className="app-loading__brand" aria-hidden="true">
-        <img className="brand-logo brand-logo--dark" src="/brand-kit/logo/algentra-horizontal-dark.svg" alt="" />
-        <img className="brand-logo brand-logo--light" src="/brand-kit/logo/algentra-horizontal-light.svg" alt="" />
-        <img className="brand-mark-image brand-mark-image--dark" src="/brand-kit/logo/algentra-mark-dark.svg" alt="" />
-        <img className="brand-mark-image brand-mark-image--light" src="/brand-kit/logo/algentra-mark-light.svg" alt="" />
+        <img className="brand-logo brand-logo--dark" src="/brand-kit/logo/algentra-horizontal-dark.png" alt="" />
+        <img className="brand-logo brand-logo--light" src="/brand-kit/logo/algentra-horizontal-light.png" alt="" />
+        <img className="brand-mark-image brand-mark-image--dark" src="/brand-kit/logo/algentra-mark-dark.png" alt="" />
+        <img className="brand-mark-image brand-mark-image--light" src="/brand-kit/logo/algentra-mark-light.png" alt="" />
       </div>
       <span className="app-loading__spinner" aria-hidden="true" />
       <p>Menyiapkan halaman Anda</p>
