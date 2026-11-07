@@ -330,18 +330,23 @@ if($RepairCloudflare -or $RepairWeb -or $RepairCoreApi){
     $selected+='AlgentraWeb'
   }
   if($RepairCloudflare){
-    $secureTunnelToken=Read-Host 'Masukkan ulang token Cloudflare Tunnel' -AsSecureString
-    if($secureTunnelToken.Length -eq 0){throw 'Token Cloudflare Tunnel tidak boleh kosong.'}
-    $tokenPointer=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureTunnelToken)
+    $secureApiToken=Read-Host 'Masukkan ulang API Token Cloudflare' -AsSecureString
+    if($secureApiToken.Length -eq 0){throw 'API Token Cloudflare tidak boleh kosong.'}
+    $tokenPointer=[Runtime.InteropServices.Marshal]::SecureStringToBSTR($secureApiToken)
     try{
-      $tunnelToken=[Runtime.InteropServices.Marshal]::PtrToStringBSTR($tokenPointer).Trim()
-      if(-not $tunnelToken){throw 'Token Cloudflare Tunnel tidak boleh kosong.'}
-      Assert-CloudflareTunnelToken $tunnelToken
+      $apiToken=[Runtime.InteropServices.Marshal]::PtrToStringBSTR($tokenPointer).Trim()
+      if(-not $apiToken){throw 'API Token Cloudflare tidak boleh kosong.'}
+      $cloudflareSetup=Join-Path $InstallDir 'infra\windows\configure-cloudflare-tunnel.ps1'
+      if(-not(Test-Path -LiteralPath $cloudflareSetup -PathType Leaf)){throw "Setup Cloudflare tidak ditemukan: $cloudflareSetup"}
+      Ensure-CloudflaredBinary
+      Assert-CloudflaredSupportsTokenFile
+      $cloudflareResultRaw=& $cloudflareSetup -PublicDomain $v.PUBLIC_DOMAIN -ApiToken $apiToken
+      $cloudflareResult=($cloudflareResultRaw -join "`n")|ConvertFrom-Json -ErrorAction Stop
+      if(-not $cloudflareResult.tunnel_token){throw 'Cloudflare API tidak mengembalikan token tunnel.'}
+      Assert-CloudflareTunnelToken ([string]$cloudflareResult.tunnel_token)
       New-Item -ItemType Directory -Path $SecretsDir -Force|Out-Null
-      Set-Content -LiteralPath $TunnelTokenFile -Value $tunnelToken -NoNewline -Encoding ascii
-    }finally{[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($tokenPointer)}
-    Ensure-CloudflaredBinary
-    Assert-CloudflaredSupportsTokenFile
+      Set-Content -LiteralPath $TunnelTokenFile -Value ([string]$cloudflareResult.tunnel_token) -NoNewline -Encoding ascii
+    }finally{[Runtime.InteropServices.Marshal]::ZeroFreeBSTR($tokenPointer);Remove-Variable apiToken -ErrorAction SilentlyContinue;$secureApiToken.Dispose()}
     $tunnelLogFile=Join-Path $InstallDir 'logs\tunnel\cloudflared.log'
     Install-Service 'AlgentraTunnel' (Join-Path $BinDir 'cloudflared.exe') "tunnel --loglevel info --logfile `"$tunnelLogFile`" run --token-file `"$TunnelTokenFile`"" $BinDir (Join-Path $InstallDir 'logs\tunnel')
     Set-TunnelTokenAcl
