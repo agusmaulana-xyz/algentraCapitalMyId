@@ -351,10 +351,10 @@ export function SiteFrame({ children }: { children: React.ReactNode }) {
       </a>
       <header className="topbar">
         <a className="brand" href={isAdmin ? "/dashboard" : "/"}>
-          <img className="brand-logo brand-logo--dark" src="/brand-kit/logo/algentra-horizontal-dark.svg" alt="Algentra Capital" />
-          <img className="brand-logo brand-logo--light" src="/brand-kit/logo/algentra-horizontal-light.svg" alt="" aria-hidden="true" />
-          <img className="brand-mark-image brand-mark-image--dark" src="/brand-kit/logo/algentra-mark-dark.svg" alt="" aria-hidden="true" />
-          <img className="brand-mark-image brand-mark-image--light" src="/brand-kit/logo/algentra-mark-light.svg" alt="" aria-hidden="true" />
+          <img className="brand-logo brand-logo--dark" src="/brand-kit/logo/algentra-horizontal-dark.png" alt="Algentra Capital" />
+          <img className="brand-logo brand-logo--light" src="/brand-kit/logo/algentra-horizontal-light.png" alt="" aria-hidden="true" />
+          <img className="brand-mark-image brand-mark-image--dark" src="/brand-kit/logo/algentra-mark-dark.png" alt="" aria-hidden="true" />
+          <img className="brand-mark-image brand-mark-image--light" src="/brand-kit/logo/algentra-mark-light.png" alt="" aria-hidden="true" />
         </a>
         <nav
           className={`site-nav${navOpen ? " is-open" : ""}`}

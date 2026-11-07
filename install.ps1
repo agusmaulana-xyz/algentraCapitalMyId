@@ -46,6 +46,22 @@ function Get-ServiceFailureDetails([string]$Name) {
   }
   return ($parts -join "`n")
 }
+function Test-PublicDomain([string]$Domain,[int]$Attempts=6,[int]$DelaySeconds=5) {
+  $lastStatus='tidak ada respons'
+  for($attempt=1;$attempt -le $Attempts;$attempt++){
+    try{
+      $response=Invoke-WebRequest "https://$Domain/" -UseBasicParsing -TimeoutSec 8
+      if($response.StatusCode -eq 200){return [pscustomobject]@{Success=$true;Status='HTTP 200'}}
+      $lastStatus="HTTP $($response.StatusCode)"
+    }catch{
+      $statusCode=$null
+      if($_.Exception.Response -and $_.Exception.Response.StatusCode){$statusCode=[int]$_.Exception.Response.StatusCode}
+      if($statusCode){$lastStatus="HTTP $statusCode"}else{$lastStatus='tidak ada respons'}
+    }
+    if($attempt -lt $Attempts){Start-Sleep -Seconds $DelaySeconds}
+  }
+  return [pscustomobject]@{Success=$false;Status=$lastStatus}
+}
 function Assert-CloudflareTunnelToken([string]$Value) {
   $encoded=$Value.Trim()
   if($encoded -match '^(?i:cfut_|cfat_|cfk_)'){throw 'Token yang dimasukkan adalah kredensial API Cloudflare, bukan token connector Tunnel. Untuk -RepairCloudflare, gunakan token tunnel berawalan eyJ dari perintah Add a replica di Cloudflare Zero Trust.'}
@@ -370,8 +386,9 @@ if($RepairCloudflare -or $RepairWeb -or $RepairCoreApi){
   if($RepairCoreApi){$null=Invoke-RestMethod 'http://127.0.0.1:8000/ready' -TimeoutSec 45;Write-Host 'Core API berhasil diperbaiki dan siap.'}
   if($RepairWeb){$null=Invoke-WebRequest 'http://127.0.0.1:3000/' -UseBasicParsing -TimeoutSec 30;Write-Host 'Web berhasil diperbaiki dan siap.'}
   if($RepairCloudflare){
-    try{$null=Invoke-WebRequest "https://$($v.PUBLIC_DOMAIN)/" -UseBasicParsing -TimeoutSec 30;Write-Host "Cloudflare Tunnel aktif untuk $($v.PUBLIC_DOMAIN)."}
-    catch{$tunnelDetails=Get-ServiceFailureDetails 'AlgentraTunnel';Write-Warning "Service tunnel berjalan tetapi domain publik belum merespons. Log tunnel:`n$tunnelDetails`nPenyebab pemeriksaan publik: $_"}
+    $publicCheck=Test-PublicDomain $v.PUBLIC_DOMAIN
+    if($publicCheck.Success){Write-Host "Cloudflare Tunnel aktif untuk $($v.PUBLIC_DOMAIN)."}
+    else{Write-Warning "Domain belum merespons setelah beberapa percobaan ($($publicCheck.Status)). Periksa status tunnel dan DNS Cloudflare."}
   }
   exit 0
 }
@@ -481,7 +498,8 @@ Write-InstallLog 'Service Core API, web, dan tunnel telah dimulai.'
 Register-AlgentraTasks;if(-not $v.TELEGRAM_BOT_TOKEN -or -not $v.TELEGRAM_ADMIN_CHAT_ID){Write-Warning 'Backup dan watchdog Telegram belum dijadwalkan; lengkapi konfigurasi bot lalu jalankan install.ps1 -Repair.'}
 try{$ready=Invoke-RestMethod 'http://127.0.0.1:8000/ready' -TimeoutSec 30;$web=Invoke-WebRequest 'http://127.0.0.1:3000' -UseBasicParsing -TimeoutSec 30;if($ready.status -ne 'ready' -or $web.StatusCode -ne 200){throw 'Smoke check service gagal'}}catch{throw "Service terpasang tetapi verifikasi gagal: $_"}
 Install-ManagedWorkerTask
-try{$public=Invoke-WebRequest "https://$($v.PUBLIC_DOMAIN)/" -UseBasicParsing -TimeoutSec 30;if($public.StatusCode -ne 200){$tunnelDetails=Get-ServiceFailureDetails 'AlgentraTunnel';Write-Warning "Domain publik menjawab HTTP $($public.StatusCode); log AlgentraTunnel:`n$tunnelDetails"}}catch{$tunnelDetails=Get-ServiceFailureDetails 'AlgentraTunnel';Write-Warning "Domain publik belum menjawab; log AlgentraTunnel:`n$tunnelDetails`nPenyebab pemeriksaan publik: $_"}
+$publicCheck=Test-PublicDomain $v.PUBLIC_DOMAIN
+if(-not $publicCheck.Success){Write-Warning "Domain belum merespons setelah beberapa percobaan ($($publicCheck.Status)). Periksa status tunnel dan DNS Cloudflare."}
 Write-Host "Instalasi Algentra siap di $InstallDir. Domain: https://$($v.PUBLIC_DOMAIN)"
 Write-InstallLog 'Pemeriksaan lokal selesai; domain publik harus dilihat pada output instalasi.'
 
