@@ -13,6 +13,10 @@ import (
 
 var symbolTokenPattern = regexp.MustCompile(`[A-Za-z0-9._#@+\-]{3,32}`)
 
+func forbiddenStartupSymbol(symbol string) bool {
+	return strings.HasPrefix(strings.ToUpper(strings.TrimSpace(symbol)), "XAUUSD247")
+}
+
 // knownAccountSymbol returns a symbol that the broker has already served to
 // this account. A chart opened on a symbol the account does not have is dead
 // and never runs the attached Expert, so the startup symbol must come from the
@@ -21,7 +25,7 @@ var symbolTokenPattern = regexp.MustCompile(`[A-Za-z0-9._#@+\-]{3,32}`)
 func (w *worker) knownAccountSymbol(accountID, login int64, accountDir string) string {
 	path := filepath.Join(w.cfg.runtimeDir, "states", fmt.Sprintf("%d.gold-symbol", accountID))
 	if raw, err := os.ReadFile(path); err == nil {
-		if symbol := strings.TrimSpace(string(raw)); symbol != "" && !strings.ContainsAny(symbol, "\r\n,=") {
+		if symbol := strings.TrimSpace(string(raw)); symbol != "" && !forbiddenStartupSymbol(symbol) && !strings.ContainsAny(symbol, "\r\n,=") {
 			return symbol
 		}
 	}
@@ -41,7 +45,7 @@ func marketWatchSymbol(accountDir string, login int64) string {
 			continue
 		}
 		name := filepath.Base(dir)
-		if !symbolTokenPattern.MatchString(name) || symbolTokenPattern.FindString(name) != name {
+		if !symbolTokenPattern.MatchString(name) || symbolTokenPattern.FindString(name) != name || forbiddenStartupSymbol(name) {
 			continue
 		}
 		if strings.HasPrefix(strings.ToUpper(name), "XAUUSD") {
@@ -75,6 +79,9 @@ func selectedSymbol(accountDir string, login int64) string {
 		}
 		serverDir := filepath.Dir(filepath.Dir(file))
 		for _, token := range symbolTokenPattern.FindAllString(string(utf16.Decode(units)), -1) {
+			if forbiddenStartupSymbol(token) {
+				continue
+			}
 			if strings.HasPrefix(strings.ToUpper(token), "XAUUSD") {
 				return token
 			}

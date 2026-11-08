@@ -111,7 +111,7 @@ func (w *worker) prepareManagedEA(j job, token, terminalDir, name string, report
 		path := filepath.Join(w.cfg.runtimeDir, "states", fmt.Sprintf("%d.gold-symbol", j.AccountID))
 		if raw, readErr := os.ReadFile(path); readErr == nil {
 			resolved := strings.TrimSpace(string(raw))
-			if resolved != "" && !strings.ContainsAny(resolved, "\r\n,=") {
+			if resolved != "" && !forbiddenStartupSymbol(resolved) && !strings.ContainsAny(resolved, "\r\n,=") {
 				followerSymbolMap = "XAUUSD=" + resolved
 			}
 		} else if !os.IsNotExist(readErr) {
@@ -177,6 +177,9 @@ func writeCustomPreset(path string, params map[string]string) error {
 
 func managedSymbolMap(followerSymbol string) string {
 	followerSymbol = strings.TrimSpace(followerSymbol)
+	if forbiddenStartupSymbol(followerSymbol) {
+		return ""
+	}
 	// XAUUSD was the historical UI default. Treat it as automatic so existing
 	// profiles can discover broker suffixes such as XAUUSDc/XAUUSDm themselves.
 	if followerSymbol == "" || strings.EqualFold(followerSymbol, "AUTO") || strings.EqualFold(followerSymbol, "XAUUSD") {

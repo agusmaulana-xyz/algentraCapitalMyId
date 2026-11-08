@@ -148,7 +148,7 @@ func (w *worker) probeLogin(check loginCheck) (bool, string) {
 		_ = os.Remove(bootstrapINI)
 		clearSavedCharts(accountDir)
 		if startupSymbol == "" {
-			startupSymbol = "XAUUSD"
+			return false, "Login broker berhasil, tetapi MT5 belum menemukan simbol Market Watch yang tersedia. Coba lagi setelah terminal selesai menyinkronkan simbol."
 		}
 	}
 	ini := strings.Join([]string{

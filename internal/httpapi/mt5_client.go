@@ -92,7 +92,11 @@ func (api clientMT5API) configureManagedCopy(w http.ResponseWriter, r *http.Requ
 	if p.MaxOpenPositions.Present {
 		positions = p.MaxOpenPositions.Value
 	}
-	if !validLength(password, 1, 128) || len(symbol) > 64 || (symbol != "" && !followerSymbolInput.MatchString(symbol)) || (mode != "tetap" && mode != "rasio") || !finite(ratio) || ratio <= 0 || ratio > 5 || !finite(fixedLot) || fixedLot <= 0 || fixedLot > 5 || !finite(orderLot) || orderLot <= 0 || orderLot > 5 || !finite(totalLot) || totalLot <= 0 || totalLot > 10 || orderLot > totalLot || positions < 1 || positions > 50 {
+	if strings.HasPrefix(strings.ToUpper(strings.TrimSpace(symbol)), "XAUUSD247") {
+		writeError(w, 422, "Simbol XAUUSD247 tidak didukung. Kosongkan simbol agar sistem memilih simbol akun yang tersedia.")
+		return
+	}
+	if !validLength(password, 1, 128) || len(symbol) > 64 || (symbol != "" && !followerSymbolInput.MatchString(symbol)) || (mode != "tetap" && mode != "rasio") || !finite(ratio) || ratio <= 0 || ratio > 5 || !finite(fixedLot) || fixedLot <= 0 || !finite(orderLot) || orderLot <= 0 || orderLot > 5 || !finite(totalLot) || totalLot <= 0 || totalLot > 10 || orderLot > totalLot || positions < 1 || positions > 50 {
 		writeError(w, 422, "Pengaturan lot atau kredensial broker tidak valid")
 		return
 	}
