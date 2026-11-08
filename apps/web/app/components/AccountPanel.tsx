@@ -357,7 +357,7 @@ function ManagedAccountCard({
   const [identityBusy, setIdentityBusy] = useState(false);
 
   useEffect(() => {
-    if (!saveWaitingForLogin) return;
+    if (!saveWaitingForLogin && profile.login_status !== "CHECKING") return;
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout>;
     const checkLogin = async () => {
@@ -377,7 +377,7 @@ function ManagedAccountCard({
     };
     timer = setTimeout(checkLogin, 1500);
     return () => { cancelled = true; clearTimeout(timer); };
-  }, [account.id, saveWaitingForLogin]);
+  }, [account.id, profile.login_status, saveWaitingForLogin]);
   const [identityServerQuery, setIdentityServerQuery] = useState(account.server);
   const [identityServerOptions, setIdentityServerOptions] = useState<BrokerServerOption[]>([]);
   const [identitySelectedServer, setIdentitySelectedServer] = useState(account.server);
@@ -852,7 +852,7 @@ function ManagedAccountCard({
           </button>
         </div>
       </form>
-      {saveSettingsBusy || saveWaitingForLogin ? (
+      {saveSettingsBusy || saveWaitingForLogin || profile.login_status === "CHECKING" ? (
         <div className="managed-save-overlay" role="dialog" aria-label="Proses penyimpanan pengaturan" aria-live="polite" aria-modal="true">
           <div className="managed-save-progress">
             <span className="app-loading__spinner" aria-hidden="true" />
@@ -860,7 +860,7 @@ function ManagedAccountCard({
             <p>{saveSettingsBusy
               ? "Pengaturan sedang disimpan dan pemeriksaan terminal sedang disiapkan."
               : "Login broker dan kesiapan terminal MT5 sedang diperiksa. Estimasi waktu 2–5 menit."}</p>
-            {saveWaitingForLogin ? <span className="managed-save-progress__hint">Halaman akan diperbarui setelah pemeriksaan selesai.</span> : null}
+            {saveWaitingForLogin || profile.login_status === "CHECKING" ? <span className="managed-save-progress__hint">Halaman akan diperbarui setelah pemeriksaan selesai.</span> : null}
           </div>
         </div>
       ) : null}
