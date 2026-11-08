@@ -648,7 +648,7 @@ function ManagedAccountCard({
   const showSaveProgress = saveSettingsBusy || saveWaitingForLogin || profile.login_status === "CHECKING";
 
   return (
-    <article className={`card${showSaveProgress ? " managed-account-card--saving" : ""}`}>
+    <article className="card">
       <h3>{account.label}</h3>
       <p>{detail}</p>
       <p className="muted">{stateText}</p>
@@ -855,14 +855,20 @@ function ManagedAccountCard({
         </div>
       </form>
       {showSaveProgress ? (
-        <div className="managed-save-overlay" role="status" aria-label="Proses penyimpanan pengaturan" aria-live="polite">
+        <div className="app-loading app-loading--overlay managed-save-overlay" role="status" aria-label="Proses penyimpanan pengaturan" aria-live="polite">
           <div className="managed-save-progress">
+            <div className="app-loading__brand" aria-hidden="true">
+              <img className="brand-logo brand-logo--dark" src="/brand-kit/logo/algentra-horizontal-dark.png" alt="" />
+              <img className="brand-logo brand-logo--light" src="/brand-kit/logo/algentra-horizontal-light.png" alt="" />
+              <img className="brand-mark-image brand-mark-image--dark" src="/brand-kit/logo/algentra-mark-dark.png" alt="" />
+              <img className="brand-mark-image brand-mark-image--light" src="/brand-kit/logo/algentra-mark-light.png" alt="" />
+            </div>
             <span className="app-loading__spinner" aria-hidden="true" />
             <h3>{saveSettingsBusy ? "Menyimpan pengaturan" : "Memeriksa login broker"}</h3>
-            <p>{saveSettingsBusy
+            <p className="managed-save-progress__description">{saveSettingsBusy
               ? "Pengaturan sedang disimpan dan pemeriksaan terminal sedang disiapkan."
               : "Login broker dan kesiapan terminal MT5 sedang diperiksa. Estimasi waktu 2–5 menit."}</p>
-            {saveWaitingForLogin || profile.login_status === "CHECKING" ? <span className="managed-save-progress__hint">Halaman akan diperbarui setelah pemeriksaan selesai.</span> : null}
+            {saveWaitingForLogin || profile.login_status === "CHECKING" ? <span className="app-loading__hint">Halaman akan diperbarui setelah pemeriksaan selesai.</span> : null}
           </div>
         </div>
       ) : null}
