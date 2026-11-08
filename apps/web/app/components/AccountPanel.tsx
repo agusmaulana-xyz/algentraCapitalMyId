@@ -356,6 +356,19 @@ function ManagedAccountCard({
   const [editingIdentity, setEditingIdentity] = useState(false);
   const [identityBusy, setIdentityBusy] = useState(false);
 
+  const [identityServerQuery, setIdentityServerQuery] = useState(account.server);
+  const [identityServerOptions, setIdentityServerOptions] = useState<BrokerServerOption[]>([]);
+  const [identitySelectedServer, setIdentitySelectedServer] = useState(account.server);
+  const [identityManualServer, setIdentityManualServer] = useState(false);
+  const [identityServerText, setIdentityServerText] = useState(account.server);
+  const [identityServerSearchMessage, setIdentityServerSearchMessage] = useState("");
+  const [identityServerSearchBusy, setIdentityServerSearchBusy] = useState(false);
+  const profile: ManagedCopy = account.managed_copy ?? {
+    configured: false,
+    active: false,
+    status: "SETUP_REQUIRED",
+  };
+
   useEffect(() => {
     if (!saveWaitingForLogin && profile.login_status !== "CHECKING") return;
     let cancelled = false;
@@ -378,18 +391,6 @@ function ManagedAccountCard({
     timer = setTimeout(checkLogin, 1500);
     return () => { cancelled = true; clearTimeout(timer); };
   }, [account.id, profile.login_status, saveWaitingForLogin]);
-  const [identityServerQuery, setIdentityServerQuery] = useState(account.server);
-  const [identityServerOptions, setIdentityServerOptions] = useState<BrokerServerOption[]>([]);
-  const [identitySelectedServer, setIdentitySelectedServer] = useState(account.server);
-  const [identityManualServer, setIdentityManualServer] = useState(false);
-  const [identityServerText, setIdentityServerText] = useState(account.server);
-  const [identityServerSearchMessage, setIdentityServerSearchMessage] = useState("");
-  const [identityServerSearchBusy, setIdentityServerSearchBusy] = useState(false);
-  const profile: ManagedCopy = account.managed_copy ?? {
-    configured: false,
-    active: false,
-    status: "SETUP_REQUIRED",
-  };
   const detail = `Dikelola server · ${account.login} · ${account.server} · ${plan.name}`;
   const stateText = `${
     profile.active ? "Copy aktif" : "Copy dijeda"
