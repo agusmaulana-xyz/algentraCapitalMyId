@@ -1,6 +1,7 @@
 "use client";
 
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { apiRequest, apiUpload } from "../lib/api";
 import {
   formatInteger,
@@ -350,11 +351,16 @@ function ManagedAccountCard({
   const [copyToggleBusy, setCopyToggleBusy] = useState(false);
   const [saveSettingsBusy, setSaveSettingsBusy] = useState(false);
   const [saveWaitingForLogin, setSaveWaitingForLogin] = useState(false);
+  const [loaderPortalRoot, setLoaderPortalRoot] = useState<HTMLElement | null>(null);
   const liveConfirmDialogRef = useRef<HTMLDialogElement>(null);
   const onReloadRef = useRef(onReload);
   onReloadRef.current = onReload;
   const [editingIdentity, setEditingIdentity] = useState(false);
   const [identityBusy, setIdentityBusy] = useState(false);
+
+  useEffect(() => {
+    setLoaderPortalRoot(document.body);
+  }, []);
 
   const [identityServerQuery, setIdentityServerQuery] = useState(account.server);
   const [identityServerOptions, setIdentityServerOptions] = useState<BrokerServerOption[]>([]);
@@ -854,7 +860,7 @@ function ManagedAccountCard({
           </button>
         </div>
       </form>
-      {showSaveProgress ? (
+      {showSaveProgress && loaderPortalRoot ? createPortal(
         <div className="app-loading app-loading--overlay managed-save-overlay" role="status" aria-label="Proses penyimpanan pengaturan" aria-live="polite">
           <div className="managed-save-progress">
             <div className="app-loading__brand" aria-hidden="true">
@@ -870,7 +876,8 @@ function ManagedAccountCard({
               : "Login broker dan kesiapan terminal MT5 sedang diperiksa. Estimasi waktu 2–5 menit."}</p>
             {saveWaitingForLogin || profile.login_status === "CHECKING" ? <span className="app-loading__hint">Halaman akan diperbarui setelah pemeriksaan selesai.</span> : null}
           </div>
-        </div>
+        </div>,
+        loaderPortalRoot,
       ) : null}
       {account.ea_mode !== "CUSTOM" ? <div className="toolbar">
         <button
