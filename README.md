@@ -52,7 +52,7 @@ Setelah mengubah source, jalankan mode repair dari PowerShell Administrator. Rep
 .\install.ps1 -InstallDir C:\AppServer -Repair
 ```
 
-Untuk memperbaiki satu service saja, gunakan salah satu switch berikut. Repair terpisah memasang ulang konfigurasi service dan memulai service itu; web dan binary Core API harus sudah tersedia di instalasi. `-RepairCloudflare` meminta API token Cloudflare secara tersembunyi, lalu memakai API untuk menyegarkan konfigurasi ingress, DNS domain, dan token Tunnel sebelum memasang ulang service. API token hanya digunakan selama perintah berjalan dan tidak disimpan ke disk. Gunakan token dengan izin Tunnel Read/Edit, Zone DNS Edit, dan Zone Read. Service tunnel dipaksa memakai HTTP/2 karena sebagian jaringan memblokir UDP/QUIC; server perlu mengizinkan koneksi keluar TCP port 7844.
+Untuk memperbaiki satu service saja, gunakan salah satu switch berikut. `-RepairWeb` menyalin source web dari paket installer, menjalankan `npm ci` dan `npm run build`, lalu memasang ulang dan memulai service web. `-RepairCoreApi` memasang ulang service dari binary Core API yang tersedia di instalasi. `-RepairCloudflare` meminta API token Cloudflare secara tersembunyi, lalu memakai API untuk menyegarkan konfigurasi ingress, DNS domain, dan token Tunnel sebelum memasang ulang service. API token hanya digunakan selama perintah berjalan dan tidak disimpan ke disk. Gunakan token dengan izin Tunnel Read/Edit, Zone DNS Edit, dan Zone Read. Service tunnel dipaksa memakai HTTP/2 karena sebagian jaringan memblokir UDP/QUIC; server perlu mengizinkan koneksi keluar TCP port 7844.
 
 ```powershell
 .\install.ps1 -InstallDir C:\AppServer -RepairCloudflare

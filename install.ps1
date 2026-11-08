@@ -354,6 +354,7 @@ if($RepairCloudflare -or $RepairWeb -or $RepairCoreApi){
     $selected+='AlgentraCoreApi'
   }
   if($RepairWeb){
+    Build-WebPackage
     $webDir=Join-Path $InstallDir 'web'
     $next=Join-Path $webDir 'node_modules\next\dist\bin\next'
     $node=Join-Path $webDir 'node.exe'
