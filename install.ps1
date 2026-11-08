@@ -85,7 +85,10 @@ function Start-AlgentraServices([string[]]$Names=@('AlgentraCoreApi','AlgentraWe
         $service=Get-Service $name -ErrorAction SilentlyContinue
         if($service -and $service.Status -eq 'Running'){break}
       }while((Get-Date) -lt $deadline)
-      if($startExit -ne 0 -or -not $service -or $service.Status -ne 'Running'){
+      # NSSM may return exit 1 when Start is issued during START_PENDING even
+      # though the service finishes starting successfully. The final SCM state
+      # is authoritative after the wait above.
+      if(-not $service -or $service.Status -ne 'Running'){
         $details=Get-ServiceFailureDetails $name
         throw "Gagal menjalankan $name (NSSM exit $startExit). $($startOutput -join ' ')`n$details"
       }
