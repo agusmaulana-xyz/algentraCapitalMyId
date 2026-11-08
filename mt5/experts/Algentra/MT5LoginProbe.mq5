@@ -96,6 +96,8 @@ bool ResolveGoldSymbol(string &resolved)
       string candidate = SymbolName(i, false);
       string upper = candidate;
       StringToUpper(upper);
+      if(StringFind(upper, "XAUUSD247") == 0)
+         continue;
       if(SymbolInfoInteger(candidate, SYMBOL_TRADE_MODE) == SYMBOL_TRADE_MODE_DISABLED ||
          !SymbolSelect(candidate, true))
          continue;

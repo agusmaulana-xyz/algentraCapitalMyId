@@ -351,8 +351,10 @@ if($RepairCloudflare -or $RepairWeb -or $RepairCoreApi){
     if(-not(Test-Path -LiteralPath $workerPackageSource -PathType Container)){throw "Source copier worker tidak ditemukan: $workerPackageSource"}
     $apiScriptSource=Join-Path $Source 'infra\windows\start-core-api.ps1'
     if(-not(Test-Path -LiteralPath $apiScriptSource -PathType Leaf)){throw "Source startup Core API tidak ditemukan: $apiScriptSource"}
+    $expertSource=Join-Path $Source 'mt5\experts'
+    foreach($relative in @('MT5FollowerCopyEA.mq5','Algentra\MT5LoginProbe.mq5')){if(-not(Test-Path -LiteralPath (Join-Path $expertSource $relative) -PathType Leaf)){throw "Source Expert MT5 tidak ditemukan: $(Join-Path $expertSource $relative)"}}
     if(-not(Get-Command go.exe -ErrorAction SilentlyContinue)){throw 'Go belum tersedia di PATH; -RepairCoreApi memerlukan Go untuk membangun Core API dan copier worker terbaru.'}
-    foreach($requiredSource in @('go.mod','cmd\algentra-backend','cmd\copier-worker')){if(-not(Test-Path -LiteralPath (Join-Path $Source $requiredSource))){throw "Source untuk build terbaru tidak ditemukan: $(Join-Path $Source $requiredSource)"}}
+    foreach($requiredSource in @('go.mod','cmd\algentra-backend','cmd\copier-worker','internal')){if(-not(Test-Path -LiteralPath (Join-Path $Source $requiredSource))){throw "Source untuk build terbaru tidak ditemukan: $(Join-Path $Source $requiredSource)"}}
     Get-ScheduledTask -ErrorAction SilentlyContinue|Where-Object{$_.TaskName -match 'Algentra.*Copier'}|ForEach-Object{Stop-ScheduledTask -TaskName $_.TaskName -ErrorAction SilentlyContinue}
     Get-Process -ErrorAction SilentlyContinue|Where-Object{$_.Path -and $_.Path.StartsWith($BinDir,[StringComparison]::OrdinalIgnoreCase) -and $_.Name -like 'copier-*'}|Stop-Process -Force -ErrorAction SilentlyContinue
     if(Get-Service AlgentraCoreApi -ErrorAction SilentlyContinue){
@@ -367,6 +369,13 @@ if($RepairCloudflare -or $RepairWeb -or $RepairCoreApi){
     $workerPackageInstall=Join-Path $InstallDir 'mt5\copier-worker'
     New-Item -ItemType Directory -Path $workerPackageInstall -Force|Out-Null
     Get-ChildItem -LiteralPath $workerPackageSource -Force|Copy-Item -Destination $workerPackageInstall -Recurse -Force
+    $expertInstall=Join-Path $InstallDir 'mt5\experts'
+    foreach($relative in @('MT5FollowerCopyEA.mq5','Algentra\MT5LoginProbe.mq5')){
+      $sourceFile=Join-Path $expertSource $relative
+      $destinationFile=Join-Path $expertInstall $relative
+      New-Item -ItemType Directory -Path (Split-Path -Parent $destinationFile) -Force|Out-Null
+      Copy-Item -LiteralPath $sourceFile -Destination $destinationFile -Force
+    }
     $apiScript=Join-Path $InstallDir 'infra\windows\start-core-api.ps1'
     New-Item -ItemType Directory -Path (Split-Path -Parent $apiScript) -Force|Out-Null
     Copy-Item -LiteralPath $apiScriptSource -Destination $apiScript -Force

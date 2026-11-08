@@ -645,9 +645,10 @@ function ManagedAccountCard({
     !profile.configured ||
     (!profile.active &&
       (!managedWorkerReady || profile.login_status !== "VALID"));
+  const showSaveProgress = saveSettingsBusy || saveWaitingForLogin || profile.login_status === "CHECKING";
 
   return (
-    <article className="card">
+    <article className={`card${showSaveProgress ? " managed-account-card--saving" : ""}`}>
       <h3>{account.label}</h3>
       <p>{detail}</p>
       <p className="muted">{stateText}</p>
@@ -853,8 +854,8 @@ function ManagedAccountCard({
           </button>
         </div>
       </form>
-      {saveSettingsBusy || saveWaitingForLogin || profile.login_status === "CHECKING" ? (
-        <div className="managed-save-overlay" role="dialog" aria-label="Proses penyimpanan pengaturan" aria-live="polite" aria-modal="true">
+      {showSaveProgress ? (
+        <div className="managed-save-overlay" role="status" aria-label="Proses penyimpanan pengaturan" aria-live="polite">
           <div className="managed-save-progress">
             <span className="app-loading__spinner" aria-hidden="true" />
             <h3>{saveSettingsBusy ? "Menyimpan pengaturan" : "Memeriksa login broker"}</h3>
