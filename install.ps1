@@ -347,8 +347,29 @@ if($RepairCloudflare -or $RepairWeb -or $RepairCoreApi){
   $selected=@()
   foreach($log in @('core-api','web','tunnel')){New-Item -ItemType Directory -Force -Path (Join-Path $InstallDir "logs\$log")|Out-Null}
   if($RepairCoreApi){
+    $workerPackageSource=Join-Path $Source 'apps\copier-worker'
+    if(-not(Test-Path -LiteralPath $workerPackageSource -PathType Container)){throw "Source copier worker tidak ditemukan: $workerPackageSource"}
+    $apiScriptSource=Join-Path $Source 'infra\windows\start-core-api.ps1'
+    if(-not(Test-Path -LiteralPath $apiScriptSource -PathType Leaf)){throw "Source startup Core API tidak ditemukan: $apiScriptSource"}
+    if(-not(Get-Command go.exe -ErrorAction SilentlyContinue)){throw 'Go belum tersedia di PATH; -RepairCoreApi memerlukan Go untuk membangun Core API dan copier worker terbaru.'}
+    foreach($requiredSource in @('go.mod','cmd\algentra-backend','cmd\copier-worker')){if(-not(Test-Path -LiteralPath (Join-Path $Source $requiredSource))){throw "Source untuk build terbaru tidak ditemukan: $(Join-Path $Source $requiredSource)"}}
+    Get-ScheduledTask -ErrorAction SilentlyContinue|Where-Object{$_.TaskName -match 'Algentra.*Copier'}|ForEach-Object{Stop-ScheduledTask -TaskName $_.TaskName -ErrorAction SilentlyContinue}
+    Get-Process -ErrorAction SilentlyContinue|Where-Object{$_.Path -and $_.Path.StartsWith($BinDir,[StringComparison]::OrdinalIgnoreCase) -and $_.Name -like 'copier-*'}|Stop-Process -Force -ErrorAction SilentlyContinue
+    if(Get-Service AlgentraCoreApi -ErrorAction SilentlyContinue){
+      $previousErrorActionPreference=$ErrorActionPreference
+      try{$ErrorActionPreference='Continue';& $Nssm stop AlgentraCoreApi 2>&1|Out-Null}finally{$ErrorActionPreference=$previousErrorActionPreference}
+      $stopDeadline=(Get-Date).AddSeconds(30)
+      do{Start-Sleep -Milliseconds 500;$coreService=Get-Service AlgentraCoreApi -ErrorAction SilentlyContinue}while($coreService -and $coreService.Status -ne 'Stopped' -and (Get-Date) -lt $stopDeadline)
+      if($coreService -and $coreService.Status -ne 'Stopped'){throw 'Core API belum berhenti; binary tidak akan ditimpa saat service masih berjalan.'}
+    }
+    Ensure-GoBinary 'algentra-backend.exe' './cmd/algentra-backend' -Rebuild
+    Ensure-CopierBinaries -Rebuild
+    $workerPackageInstall=Join-Path $InstallDir 'mt5\copier-worker'
+    New-Item -ItemType Directory -Path $workerPackageInstall -Force|Out-Null
+    Get-ChildItem -LiteralPath $workerPackageSource -Force|Copy-Item -Destination $workerPackageInstall -Recurse -Force
     $apiScript=Join-Path $InstallDir 'infra\windows\start-core-api.ps1'
-    if(-not(Test-Path -LiteralPath $apiScript -PathType Leaf)){throw "Startup Core API tidak ditemukan: $apiScript"}
+    New-Item -ItemType Directory -Path (Split-Path -Parent $apiScript) -Force|Out-Null
+    Copy-Item -LiteralPath $apiScriptSource -Destination $apiScript -Force
     Install-Service 'AlgentraCoreApi' 'powershell.exe' "-NoProfile -ExecutionPolicy Bypass -File `"$apiScript`" -ProjectRoot `"$InstallDir`" -EnvironmentFile `"$EnvFile`"" $InstallDir (Join-Path $InstallDir 'logs\core-api')
     Set-EnvAcl
     $selected+='AlgentraCoreApi'
@@ -387,7 +408,7 @@ if($RepairCloudflare -or $RepairWeb -or $RepairCoreApi){
     $selected+='AlgentraTunnel'
   }
   Start-AlgentraServices $selected
-  if($RepairCoreApi){$null=Invoke-RestMethod 'http://127.0.0.1:8000/ready' -TimeoutSec 45;Write-Host 'Core API berhasil diperbaiki dan siap.'}
+  if($RepairCoreApi){$null=Invoke-RestMethod 'http://127.0.0.1:8000/ready' -TimeoutSec 45;Install-ManagedWorkerTask;Write-Host 'Core API dan copier worker berhasil dibangun ulang dari source dan siap.'}
   if($RepairWeb){$null=Invoke-WebRequest 'http://127.0.0.1:3000/' -UseBasicParsing -TimeoutSec 30;Write-Host 'Web berhasil diperbaiki dan siap.'}
   if($RepairCloudflare){
     $publicCheck=Test-PublicDomain $v.PUBLIC_DOMAIN
