@@ -85,7 +85,10 @@ function Start-AlgentraServices([string[]]$Names=@('AlgentraCoreApi','AlgentraWe
         $service=Get-Service $name -ErrorAction SilentlyContinue
         if($service -and $service.Status -eq 'Running'){break}
       }while((Get-Date) -lt $deadline)
-      if($startExit -ne 0 -or -not $service -or $service.Status -ne 'Running'){
+      # NSSM may return exit 1 when Start is issued during START_PENDING even
+      # though the service finishes starting successfully. The final SCM state
+      # is authoritative after the wait above.
+      if(-not $service -or $service.Status -ne 'Running'){
         $details=Get-ServiceFailureDetails $name
         throw "Gagal menjalankan $name (NSSM exit $startExit). $($startOutput -join ' ')`n$details"
       }
@@ -253,10 +256,10 @@ function Ensure-GoBinary([string]$Name,[string]$Package,[switch]$Rebuild) {
     Write-Host "$Name dibuat otomatis dari source Go."
   } finally { $env:GOOS=$oldGoos;$env:GOARCH=$oldGoarch;$env:CGO_ENABLED=$oldCgo }
 }
-function Build-WebPackage {
+function Build-WebPackage([string]$Destination=(Join-Path $InstallDir 'web')) {
   $webSource=Join-Path $Source 'apps\web'
   if(-not(Test-Path -LiteralPath (Join-Path $webSource 'package.json') -PathType Leaf) -or -not(Test-Path -LiteralPath (Join-Path $webSource 'package-lock.json') -PathType Leaf)){throw 'Source web Next.js (apps\web beserta package.json dan package-lock.json) tidak ditemukan.'}
-  $webDir=Join-Path $InstallDir 'web'
+  $webDir=[IO.Path]::GetFullPath($Destination)
   New-Item -ItemType Directory -Path $webDir -Force|Out-Null
   Get-ChildItem -LiteralPath $webSource -Force | Copy-Item -Destination $webDir -Recurse -Force
   $npm=Get-Command npm.cmd -ErrorAction SilentlyContinue
@@ -344,19 +347,99 @@ if($RepairCloudflare -or $RepairWeb -or $RepairCoreApi){
   $selected=@()
   foreach($log in @('core-api','web','tunnel')){New-Item -ItemType Directory -Force -Path (Join-Path $InstallDir "logs\$log")|Out-Null}
   if($RepairCoreApi){
+    $workerPackageSource=Join-Path $Source 'apps\copier-worker'
+    if(-not(Test-Path -LiteralPath $workerPackageSource -PathType Container)){throw "Source copier worker tidak ditemukan: $workerPackageSource"}
+    $apiScriptSource=Join-Path $Source 'infra\windows\start-core-api.ps1'
+    if(-not(Test-Path -LiteralPath $apiScriptSource -PathType Leaf)){throw "Source startup Core API tidak ditemukan: $apiScriptSource"}
+    $expertSource=Join-Path $Source 'mt5\experts'
+    foreach($relative in @('MT5FollowerCopyEA.mq5','Algentra\MT5LoginProbe.mq5')){if(-not(Test-Path -LiteralPath (Join-Path $expertSource $relative) -PathType Leaf)){throw "Source Expert MT5 tidak ditemukan: $(Join-Path $expertSource $relative)"}}
+    if(-not(Get-Command go.exe -ErrorAction SilentlyContinue)){throw 'Go belum tersedia di PATH; -RepairCoreApi memerlukan Go untuk membangun Core API dan copier worker terbaru.'}
+    foreach($requiredSource in @('go.mod','cmd\algentra-backend','cmd\copier-worker','internal')){if(-not(Test-Path -LiteralPath (Join-Path $Source $requiredSource))){throw "Source untuk build terbaru tidak ditemukan: $(Join-Path $Source $requiredSource)"}}
+    Get-ScheduledTask -ErrorAction SilentlyContinue|Where-Object{$_.TaskName -match 'Algentra.*Copier'}|ForEach-Object{Stop-ScheduledTask -TaskName $_.TaskName -ErrorAction SilentlyContinue}
+    Get-Process -ErrorAction SilentlyContinue|Where-Object{$_.Path -and $_.Path.StartsWith($BinDir,[StringComparison]::OrdinalIgnoreCase) -and $_.Name -like 'copier-*'}|Stop-Process -Force -ErrorAction SilentlyContinue
+    if(Get-Service AlgentraCoreApi -ErrorAction SilentlyContinue){
+      $previousErrorActionPreference=$ErrorActionPreference
+      try{$ErrorActionPreference='Continue';& $Nssm stop AlgentraCoreApi 2>&1|Out-Null}finally{$ErrorActionPreference=$previousErrorActionPreference}
+      $stopDeadline=(Get-Date).AddSeconds(30)
+      do{Start-Sleep -Milliseconds 500;$coreService=Get-Service AlgentraCoreApi -ErrorAction SilentlyContinue}while($coreService -and $coreService.Status -ne 'Stopped' -and (Get-Date) -lt $stopDeadline)
+      if($coreService -and $coreService.Status -ne 'Stopped'){throw 'Core API belum berhenti; binary tidak akan ditimpa saat service masih berjalan.'}
+    }
+    Ensure-GoBinary 'algentra-backend.exe' './cmd/algentra-backend' -Rebuild
+    Ensure-CopierBinaries -Rebuild
+    $workerPackageInstall=Join-Path $InstallDir 'mt5\copier-worker'
+    New-Item -ItemType Directory -Path $workerPackageInstall -Force|Out-Null
+    Get-ChildItem -LiteralPath $workerPackageSource -Force|Copy-Item -Destination $workerPackageInstall -Recurse -Force
+    $expertInstall=Join-Path $InstallDir 'mt5\experts'
+    foreach($relative in @('MT5FollowerCopyEA.mq5','Algentra\MT5LoginProbe.mq5')){
+      $sourceFile=Join-Path $expertSource $relative
+      $destinationFile=Join-Path $expertInstall $relative
+      New-Item -ItemType Directory -Path (Split-Path -Parent $destinationFile) -Force|Out-Null
+      Copy-Item -LiteralPath $sourceFile -Destination $destinationFile -Force
+    }
     $apiScript=Join-Path $InstallDir 'infra\windows\start-core-api.ps1'
-    if(-not(Test-Path -LiteralPath $apiScript -PathType Leaf)){throw "Startup Core API tidak ditemukan: $apiScript"}
+    New-Item -ItemType Directory -Path (Split-Path -Parent $apiScript) -Force|Out-Null
+    Copy-Item -LiteralPath $apiScriptSource -Destination $apiScript -Force
     Install-Service 'AlgentraCoreApi' 'powershell.exe' "-NoProfile -ExecutionPolicy Bypass -File `"$apiScript`" -ProjectRoot `"$InstallDir`" -EnvironmentFile `"$EnvFile`"" $InstallDir (Join-Path $InstallDir 'logs\core-api')
     Set-EnvAcl
     $selected+='AlgentraCoreApi'
   }
   if($RepairWeb){
     $webDir=Join-Path $InstallDir 'web'
-    $next=Join-Path $webDir 'node_modules\next\dist\bin\next'
-    $node=Join-Path $webDir 'node.exe'
+    $webStage=Join-Path $InstallDir ('.web-repair-'+[guid]::NewGuid().ToString('N'))
+    $webPrevious=Join-Path $InstallDir ('.web-previous-'+[guid]::NewGuid().ToString('N'))
+    $installRoot=[IO.Path]::GetFullPath($InstallDir).TrimEnd('\')+'\'
+    try{Build-WebPackage -Destination $webStage}catch{
+      $stageFull=[IO.Path]::GetFullPath($webStage)
+      if((Test-Path -LiteralPath $webStage) -and $stageFull.StartsWith($installRoot,[StringComparison]::OrdinalIgnoreCase)){Remove-Item -LiteralPath $webStage -Recurse -Force}
+      throw
+    }
+    $next=Join-Path $webStage 'node_modules\next\dist\bin\next'
+    $node=Join-Path $webStage 'node.exe'
     if(-not(Test-Path -LiteralPath $node)){$node=(Get-Command node.exe -ErrorAction SilentlyContinue).Source}
-    if(-not $node -or -not(Test-Path -LiteralPath $next)){throw 'Web build atau Node.js tidak ditemukan; jalankan -Repair penuh untuk membangun ulang web.'}
-    Install-Service 'AlgentraWeb' $node "`"$next`" start -p 3000" $webDir (Join-Path $InstallDir 'logs\web')
+    if(-not $node -or -not(Test-Path -LiteralPath $next)){
+      $stageFull=[IO.Path]::GetFullPath($webStage)
+      if((Test-Path -LiteralPath $webStage) -and $stageFull.StartsWith($installRoot,[StringComparison]::OrdinalIgnoreCase)){Remove-Item -LiteralPath $webStage -Recurse -Force}
+      throw 'Web build atau Node.js tidak ditemukan; build lama tetap dipakai.'
+    }
+    $service=Get-Service AlgentraWeb -ErrorAction SilentlyContinue
+    if($service){
+      $previousErrorActionPreference=$ErrorActionPreference
+      try{$ErrorActionPreference='Continue';& $Nssm stop AlgentraWeb 2>&1|Out-Null}finally{$ErrorActionPreference=$previousErrorActionPreference}
+      $stopDeadline=(Get-Date).AddSeconds(30)
+      do{Start-Sleep -Milliseconds 500;$service=Get-Service AlgentraWeb -ErrorAction SilentlyContinue}while($service -and $service.Status -ne 'Stopped' -and (Get-Date) -lt $stopDeadline)
+      if($service -and $service.Status -ne 'Stopped'){
+        $stageFull=[IO.Path]::GetFullPath($webStage)
+        if((Test-Path -LiteralPath $webStage) -and $stageFull.StartsWith($installRoot,[StringComparison]::OrdinalIgnoreCase)){Remove-Item -LiteralPath $webStage -Recurse -Force}
+        throw 'AlgentraWeb belum berhenti; build lama dibiarkan utuh.'
+      }
+    }
+    $hadPrevious=Test-Path -LiteralPath $webDir -PathType Container
+    if($hadPrevious){Move-Item -LiteralPath $webDir -Destination $webPrevious}
+    try{
+      Move-Item -LiteralPath $webStage -Destination $webDir
+      $next=Join-Path $webDir 'node_modules\next\dist\bin\next'
+      $node=Join-Path $webDir 'node.exe'
+      if(-not(Test-Path -LiteralPath $node)){$node=(Get-Command node.exe -ErrorAction SilentlyContinue).Source}
+      Install-Service 'AlgentraWeb' $node "`"$next`" start -p 3000" $webDir (Join-Path $InstallDir 'logs\web')
+      Start-AlgentraServices @('AlgentraWeb')
+      $null=Invoke-WebRequest 'http://127.0.0.1:3000/' -UseBasicParsing -TimeoutSec 30
+    }catch{
+      $repairFailure=$_
+      if(Get-Service AlgentraWeb -ErrorAction SilentlyContinue){$previousErrorActionPreference=$ErrorActionPreference;try{$ErrorActionPreference='Continue';& $Nssm stop AlgentraWeb 2>&1|Out-Null;& $Nssm remove AlgentraWeb confirm 2>&1|Out-Null}finally{$ErrorActionPreference=$previousErrorActionPreference}}
+      if(Test-Path -LiteralPath $webDir -PathType Container){Move-Item -LiteralPath $webDir -Destination (Join-Path $InstallDir ('.web-failed-'+[guid]::NewGuid().ToString('N')))}
+      if($hadPrevious -and (Test-Path -LiteralPath $webPrevious -PathType Container)){
+        Move-Item -LiteralPath $webPrevious -Destination $webDir
+        $oldNext=Join-Path $webDir 'node_modules\next\dist\bin\next'
+        $oldNode=Join-Path $webDir 'node.exe'
+        if(-not(Test-Path -LiteralPath $oldNode)){$oldNode=(Get-Command node.exe -ErrorAction SilentlyContinue).Source}
+        if($oldNode -and (Test-Path -LiteralPath $oldNext)){Install-Service 'AlgentraWeb' $oldNode "`"$oldNext`" start -p 3000" $webDir (Join-Path $InstallDir 'logs\web');Start-AlgentraServices @('AlgentraWeb')}
+      }
+      $stageFull=[IO.Path]::GetFullPath($webStage)
+      if((Test-Path -LiteralPath $webStage) -and $stageFull.StartsWith($installRoot,[StringComparison]::OrdinalIgnoreCase)){Remove-Item -LiteralPath $webStage -Recurse -Force}
+      throw "Build web baru gagal; build sebelumnya dipulihkan jika tersedia. $repairFailure"
+    }
+    $previousFull=[IO.Path]::GetFullPath($webPrevious)
+    if((Test-Path -LiteralPath $webPrevious -PathType Container) -and $previousFull.StartsWith($installRoot,[StringComparison]::OrdinalIgnoreCase)){Remove-Item -LiteralPath $webPrevious -Recurse -Force -ErrorAction SilentlyContinue}
     $selected+='AlgentraWeb'
   }
   if($RepairCloudflare){
@@ -383,8 +466,8 @@ if($RepairCloudflare -or $RepairWeb -or $RepairCoreApi){
     $selected+='AlgentraTunnel'
   }
   Start-AlgentraServices $selected
-  if($RepairCoreApi){$null=Invoke-RestMethod 'http://127.0.0.1:8000/ready' -TimeoutSec 45;Write-Host 'Core API berhasil diperbaiki dan siap.'}
-  if($RepairWeb){$null=Invoke-WebRequest 'http://127.0.0.1:3000/' -UseBasicParsing -TimeoutSec 30;Write-Host 'Web berhasil diperbaiki dan siap.'}
+  if($RepairCoreApi){$null=Invoke-RestMethod 'http://127.0.0.1:8000/ready' -TimeoutSec 45;Install-ManagedWorkerTask;Write-Host 'Core API dan copier worker berhasil dibangun ulang dari source dan siap.'}
+  if($RepairWeb){Write-Host 'Web berhasil dibangun ulang, dipasang, dan siap.'}
   if($RepairCloudflare){
     $publicCheck=Test-PublicDomain $v.PUBLIC_DOMAIN
     if($publicCheck.Success){Write-Host "Cloudflare Tunnel aktif untuk $($v.PUBLIC_DOMAIN)."}

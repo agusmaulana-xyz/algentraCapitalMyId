@@ -105,6 +105,31 @@ function SocialIcon({ icon }: { icon: string }) {
         <path d="M3 12h18M12 3a14 14 0 0 1 0 18M12 3a14 14 0 0 0 0 18"></path>
       </svg>
     );
+  if (icon === "facebook")
+    return (
+      <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <path d="M13.6 21v-8h2.7l.4-3h-3.1V8.1c0-.9.3-1.5 1.6-1.5h1.7V3.9c-.3 0-1.4-.1-2.6-.1-2.6 0-4.4 1.6-4.4 4.6V10H7v3h2.9v8z"></path>
+      </svg>
+    );
+  if (icon === "linkedin")
+    return (
+      <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <path d="M5.2 8.7a1.8 1.8 0 1 0 0-3.6 1.8 1.8 0 0 0 0 3.6M3.7 10h3v10h-3zM9 10h2.9v1.4h.1c.4-.8 1.4-1.7 2.9-1.7 3.1 0 3.7 2 3.7 4.6V20h-3v-5.1c0-1.2 0-2.7-1.7-2.7s-2 1.3-2 2.6V20H9z"></path>
+      </svg>
+    );
+  if (icon === "x")
+    return (
+      <svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
+        <path d="M18.9 3H22l-6.8 7.8L23.2 21h-6.3L12 14.8 6.6 21H3.4l7.3-8.4L2.8 3h6.5l4.5 5.9zm-1.1 16h1.7L8.2 4.9H6.4z"></path>
+      </svg>
+    );
+  if (icon === "youtube")
+    return (
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+        <path d="M21 7.2a2.5 2.5 0 0 0-1.8-1.8C17.6 5 12 5 12 5s-5.6 0-7.2.4A2.5 2.5 0 0 0 3 7.2 26 26 0 0 0 2.6 12a26 26 0 0 0 .4 4.8 2.5 2.5 0 0 0 1.8 1.8C6.4 19 12 19 12 19s5.6 0 7.2-.4a2.5 2.5 0 0 0 1.8-1.8 26 26 0 0 0 .4-4.8 26 26 0 0 0-.4-4.8Z" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round"></path>
+        <path d="m10 9 5 3-5 3z" fill="currentColor"></path>
+      </svg>
+    );
   return (
     <svg {...common}>
       <path d="M10 13a5 5 0 0 0 7.07 0l3-3A5 5 0 0 0 13 2.93l-1.72 1.72"></path>
@@ -1029,25 +1054,22 @@ export default function PublicPage() {
                 )}
               </div>
             </article>
-            <article className="contact-card">
+            <article className="contact-card contact-card--official">
               <h3>Kanal resmi</h3>
-              <p>Ikuti informasi dan pembaruan dari Algentra Capital.</p>
-              <div className="contact-links">
+              <div className="contact-links" role="group" aria-label="Kanal resmi Algentra">
                 {socials
                   .filter((social) => social.url)
                   .map((social) => (
                     <a
                       key={social.url}
-                      className="contact-link"
+                      className="contact-link contact-link--icon-only"
                       href={social.url}
                       target="_blank"
                       rel="noopener noreferrer"
+                      aria-label={social.label}
+                      title={social.label}
                     >
                       <SocialIcon icon={social.icon} />
-                      <span>
-                        {social.label}
-                        <small>{social.display}</small>
-                      </span>
                     </a>
                   ))}
                 {socials.length === 0 &&

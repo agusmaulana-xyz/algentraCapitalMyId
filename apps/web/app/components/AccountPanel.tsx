@@ -1,6 +1,7 @@
 "use client";
 
 import { Fragment, useCallback, useEffect, useRef, useState } from "react";
+import { createPortal } from "react-dom";
 import { apiRequest, apiUpload } from "../lib/api";
 import {
   formatInteger,
@@ -348,9 +349,19 @@ function ManagedAccountCard({
   const [eaMessage, setEAMessage] = useState("");
   const [liveConfirmOpen, setLiveConfirmOpen] = useState(false);
   const [copyToggleBusy, setCopyToggleBusy] = useState(false);
+  const [saveSettingsBusy, setSaveSettingsBusy] = useState(false);
+  const [saveWaitingForLogin, setSaveWaitingForLogin] = useState(false);
+  const [loaderPortalRoot, setLoaderPortalRoot] = useState<HTMLElement | null>(null);
   const liveConfirmDialogRef = useRef<HTMLDialogElement>(null);
+  const onReloadRef = useRef(onReload);
+  onReloadRef.current = onReload;
   const [editingIdentity, setEditingIdentity] = useState(false);
   const [identityBusy, setIdentityBusy] = useState(false);
+
+  useEffect(() => {
+    setLoaderPortalRoot(document.body);
+  }, []);
+
   const [identityServerQuery, setIdentityServerQuery] = useState(account.server);
   const [identityServerOptions, setIdentityServerOptions] = useState<BrokerServerOption[]>([]);
   const [identitySelectedServer, setIdentitySelectedServer] = useState(account.server);
@@ -363,6 +374,29 @@ function ManagedAccountCard({
     active: false,
     status: "SETUP_REQUIRED",
   };
+
+  useEffect(() => {
+    if (!saveWaitingForLogin && profile.login_status !== "CHECKING") return;
+    let cancelled = false;
+    let timer: ReturnType<typeof setTimeout>;
+    const checkLogin = async () => {
+      try {
+        const accounts = await apiRequest<Account[]>("mt5/accounts");
+        if (cancelled) return;
+        const current = accounts.find((item) => item.id === account.id)?.managed_copy;
+        if (current?.login_status && current.login_status !== "CHECKING") {
+          setSaveWaitingForLogin(false);
+          onReloadRef.current();
+          return;
+        }
+      } catch {
+        // Keep the progress overlay visible while the status endpoint is unavailable.
+      }
+      if (!cancelled) timer = setTimeout(checkLogin, 5000);
+    };
+    timer = setTimeout(checkLogin, 1500);
+    return () => { cancelled = true; clearTimeout(timer); };
+  }, [account.id, profile.login_status, saveWaitingForLogin]);
   const detail = `Dikelola server · ${account.login} · ${account.server} · ${plan.name}`;
   const stateText = `${
     profile.active ? "Copy aktif" : "Copy dijeda"
@@ -487,6 +521,10 @@ function ManagedAccountCard({
     const data = Object.fromEntries(
       new FormData(event.currentTarget).entries()
     ) as Record<string, FormDataEntryValue>;
+    if (String(data.follower_symbol || "").trim().toUpperCase().startsWith("XAUUSD247")) {
+      onMessage("Simbol XAUUSD247 tidak didukung. Kosongkan kolom simbol agar sistem memilih simbol akun yang tersedia.");
+      return;
+    }
     for (const key of [
       "ratio_lot",
       "lot_tetap",
@@ -496,6 +534,7 @@ function ManagedAccountCard({
     ]) {
       data[key] = Number(data[key]) as unknown as FormDataEntryValue;
     }
+    setSaveSettingsBusy(true);
     try {
       await apiRequest(`mt5/accounts/${account.id}/managed-copy`, {
         method: "PUT",
@@ -504,9 +543,12 @@ function ManagedAccountCard({
       onMessage(
         "Pengaturan tersimpan. Login broker sedang diperiksa otomatis; copy trading masih dijeda."
       );
+      setSaveWaitingForLogin(true);
       onReload();
     } catch (error) {
       onMessage(error instanceof Error ? error.message : "Permintaan tidak berhasil.");
+    } finally {
+      setSaveSettingsBusy(false);
     }
   };
 
@@ -609,6 +651,7 @@ function ManagedAccountCard({
     !profile.configured ||
     (!profile.active &&
       (!managedWorkerReady || profile.login_status !== "VALID"));
+  const showSaveProgress = saveSettingsBusy || saveWaitingForLogin || profile.login_status === "CHECKING";
 
   return (
     <article className="card">
@@ -817,6 +860,25 @@ function ManagedAccountCard({
           </button>
         </div>
       </form>
+      {showSaveProgress && loaderPortalRoot ? createPortal(
+        <div className="app-loading app-loading--overlay managed-save-overlay" role="status" aria-label="Proses penyimpanan pengaturan" aria-live="polite">
+          <div className="managed-save-progress">
+            <div className="app-loading__brand" aria-hidden="true">
+              <img className="brand-logo brand-logo--dark" src="/brand-kit/logo/algentra-horizontal-dark.png" alt="" />
+              <img className="brand-logo brand-logo--light" src="/brand-kit/logo/algentra-horizontal-light.png" alt="" />
+              <img className="brand-mark-image brand-mark-image--dark" src="/brand-kit/logo/algentra-mark-dark.png" alt="" />
+              <img className="brand-mark-image brand-mark-image--light" src="/brand-kit/logo/algentra-mark-light.png" alt="" />
+            </div>
+            <span className="app-loading__spinner" aria-hidden="true" />
+            <h3>{saveSettingsBusy ? "Menyimpan pengaturan" : "Memeriksa login broker"}</h3>
+            <p className="managed-save-progress__description">{saveSettingsBusy
+              ? "Pengaturan sedang disimpan dan pemeriksaan terminal sedang disiapkan."
+              : "Login broker dan kesiapan terminal MT5 sedang diperiksa. Estimasi waktu 2–5 menit."}</p>
+            {saveWaitingForLogin || profile.login_status === "CHECKING" ? <span className="app-loading__hint">Halaman akan diperbarui setelah pemeriksaan selesai.</span> : null}
+          </div>
+        </div>,
+        loaderPortalRoot,
+      ) : null}
       {account.ea_mode !== "CUSTOM" ? <div className="toolbar">
         <button
           type="button"

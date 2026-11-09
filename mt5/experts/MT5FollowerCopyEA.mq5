@@ -1526,7 +1526,15 @@ void PollAndCopy()
    string objects[];
    if(!JsonObjects(response, objects))
      {
-      g_connection_status = "invalid master snapshot";
+      g_connection_status = "invalid master snapshot (see Experts log)";
+      if(TimeCurrent() - g_last_log >= 15)
+        {
+         string diagnostic = StringLen(response) > 512 ? StringSubstr(response, 0, 512) + "..." : response;
+         StringReplace(diagnostic, "\r", " ");
+         StringReplace(diagnostic, "\n", " ");
+         Print("[MT5FollowerCopyEA] invalid master snapshot response: ", diagnostic);
+         g_last_log = TimeCurrent();
+        }
       return;
      }
    double copy_after = JsonNumberValue(response, "copy_after");

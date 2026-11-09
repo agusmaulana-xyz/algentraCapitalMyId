@@ -302,10 +302,10 @@ func publicContact(contact ContactConfig) http.HandlerFunc {
 			{contact.Telegram, "telegram", "Telegram"},
 			{contact.TikTok, "tiktok", "TikTok"},
 			{contact.Website, "website", "Website"},
-			{contact.Facebook, "generic", "Facebook"},
-			{contact.LinkedIn, "generic", "LinkedIn"},
-			{contact.X, "generic", "X"},
-			{contact.YouTube, "generic", "YouTube"},
+			{contact.Facebook, "facebook", "Facebook"},
+			{contact.LinkedIn, "linkedin", "LinkedIn"},
+			{contact.X, "x", "X"},
+			{contact.YouTube, "youtube", "YouTube"},
 		} {
 			value := strings.TrimSpace(entry.value)
 			if value == "" {
