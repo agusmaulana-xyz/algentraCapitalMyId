@@ -467,25 +467,6 @@ func validateParserClassification(c signalClassification, s parserSettings) (str
 	if !parserResolvedSymbolPattern.MatchString(symbol) {
 		return "REJECTED", &symbol, nil, "Nama simbol hasil pemetaan tidak valid"
 	}
-	if c.SL != nil && len(c.TP) > 0 {
-		var reference *float64
-		if a == "BUY" && c.EntryHigh != nil {
-			reference = c.EntryHigh
-		} else if a == "SELL" && c.EntryLow != nil {
-			reference = c.EntryLow
-		} else {
-			reference = c.Entry
-		}
-		if reference != nil {
-			rewardDistance := math.Abs(c.TP[0] - *reference)
-			for _, target := range c.TP[1:] {
-				rewardDistance = math.Min(rewardDistance, math.Abs(target-*reference))
-			}
-			if math.Abs(*reference-*c.SL) > rewardDistance {
-				return "REJECTED", &symbol, nil, "Jarak SL lebih besar daripada jarak TP"
-			}
-		}
-	}
 	parts := []string{}
 	if c.EntryLow != nil {
 		parts = append(parts, fmt.Sprintf("ENTRY ZONE : %g–%g", *c.EntryLow, *c.EntryHigh))

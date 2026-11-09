@@ -1,5 +1,5 @@
 #property strict
-#property version   "1.102"
+#property version   "1.106"
 #property description "Executes Telegram signals, reports master MT5 balance, and publishes all open positions"
 
 #define MAX_SIGNAL_TARGETS 20
@@ -843,20 +843,73 @@ string ZoneOrderType(const string action, const double entry, const double bid, 
    return "MARKET";
   }
 
-bool CheckRewardRisk(const string symbol, const double reference, const double sl, const double tp)
+double PipSize(const string symbol)
   {
-   if(reference <= 0.0 || sl <= 0.0 || tp <= 0.0)
+   double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
+   if(point <= 0.0)
+      return 0.0;
+   int digits = (int)SymbolInfoInteger(symbol, SYMBOL_DIGITS);
+   return point * ((digits == 3 || digits == 5) ? 10.0 : 1.0);
+  }
+
+bool ResolveRRLevels(const string symbol, const string action, const double reference,
+                     const double signal_sl, const double signal_tp, const string rr_mode,
+                     const double fixed_sl_pips, const double fixed_tp_pips,
+                     const double reward_multiple, double &sl, double &tp, string &reason)
+  {
+   sl = signal_sl;
+   tp = signal_tp;
+   if(rr_mode == "SIGNAL")
       return true;
-   double tick = SymbolInfoDouble(symbol, SYMBOL_TRADE_TICK_SIZE);
-   if(tick <= 0.0)
-      tick = SymbolInfoDouble(symbol, SYMBOL_POINT);
-   return MathAbs(reference - sl) <= MathAbs(tp - reference) + tick * 0.5;
+
+   if(rr_mode == "FIXED")
+     {
+      double pip = PipSize(symbol);
+      if(pip <= 0.0 || fixed_sl_pips <= 0.0 || fixed_tp_pips < fixed_sl_pips)
+        {
+         reason = "Fixed RR requires valid manual SL/TP pips, with TP at least as far as SL";
+         return false;
+        }
+      double sl_distance = fixed_sl_pips * pip;
+      double tp_distance = fixed_tp_pips * pip;
+      sl = action == "BUY" ? reference - sl_distance : reference + sl_distance;
+      tp = action == "BUY" ? reference + tp_distance : reference - tp_distance;
+      return true;
+     }
+
+   if(rr_mode == "BY_SL")
+     {
+      if(signal_sl <= 0.0 || reward_multiple < 1.0)
+        {
+         reason = "RR by SL requires an SL signal and an RR ratio of at least 1:1";
+         return false;
+        }
+      if((action == "BUY" && signal_sl >= reference) || (action == "SELL" && signal_sl <= reference))
+        {
+         reason = "SL signal is not on the risk side of the entry price";
+         return false;
+        }
+      double risk_distance = MathAbs(reference - signal_sl);
+      if(risk_distance <= 0.0)
+        {
+         reason = "Risk distance from signal SL is zero";
+         return false;
+        }
+      sl = signal_sl;
+      tp = action == "BUY" ? reference + risk_distance * reward_multiple : reference - risk_distance * reward_multiple;
+      return true;
+     }
+
+   reason = "RR mode is invalid";
+   return false;
   }
 
 bool ValidateSignalPlan(const string symbol, const string action, const string requested_type,
                         const bool zone_order, const double requested_entry,
                         const double entry_low, const double entry_high, const double sl_input,
-                        const string tp_array, const int tp_count, const int order_count,
+                        const double tp_input, const int order_count,
+                        const string rr_mode, const double fixed_sl_pips, const double fixed_tp_pips,
+                        const double reward_multiple,
                         const double bid, const double ask, string &reason)
   {
    double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
@@ -867,13 +920,11 @@ bool ValidateSignalPlan(const string symbol, const string action, const string r
    for(int i = 0; i < order_count; i++)
      {
       double leg_entry = requested_entry;
-      double tp = tp_count > 0 ? ArrayNumberAt(tp_array, i) : 0.0;
+      double tp = tp_input;
       string order_type = requested_type;
       if(zone_order)
         {
-         if(tp_count == 0)
-            leg_entry = i == 0 ? entry_low : entry_high;
-         else if(order_count == 1)
+         if(order_count == 1)
             leg_entry = (entry_low + entry_high) / 2.0;
          else if(action == "BUY")
             leg_entry = entry_low + (entry_high - entry_low) * (double)i / (order_count - 1);
@@ -897,6 +948,9 @@ bool ValidateSignalPlan(const string symbol, const string action, const string r
         }
 
       double sl = sl_input;
+      if(!ResolveRRLevels(symbol, action, reference, sl_input, tp_input, rr_mode,
+                          fixed_sl_pips, fixed_tp_pips, reward_multiple, sl, tp, reason))
+         return false;
       if(UseDefaultSLTP && sl <= 0.0 && DefaultSLPoints > 0 && point > 0.0)
          sl = action == "BUY" ? reference - DefaultSLPoints * point : reference + DefaultSLPoints * point;
       if(UseDefaultSLTP && tp <= 0.0 && DefaultTPPoints > 0 && point > 0.0)
@@ -908,102 +962,15 @@ bool ValidateSignalPlan(const string symbol, const string action, const string r
          reason = "SL/TP invalid or inside broker stops level";
          return false;
         }
-      if(!CheckRewardRisk(symbol, reference, sl, tp))
-        {
-         reason = "Jarak SL lebih besar daripada jarak TP";
-         return false;
-        }
-     }
-   return true;
-  }
-
-bool IsOppositePendingOrder(const ENUM_ORDER_TYPE type, const string action)
-  {
-   if(action == "BUY")
-      return type == ORDER_TYPE_SELL_LIMIT || type == ORDER_TYPE_SELL_STOP || type == ORDER_TYPE_SELL_STOP_LIMIT;
-   return type == ORDER_TYPE_BUY_LIMIT || type == ORDER_TYPE_BUY_STOP || type == ORDER_TYPE_BUY_STOP_LIMIT;
-  }
-
-int CountOpposingPositions(const string symbol, const string action, double &floating_profit)
-  {
-   int count = 0;
-   floating_profit = 0.0;
-   for(int i = PositionsTotal() - 1; i >= 0; i--)
-     {
-      ulong ticket = PositionGetTicket(i);
-      if(ticket == 0 || (long)PositionGetInteger(POSITION_MAGIC) != MagicNumber ||
-         PositionGetString(POSITION_SYMBOL) != symbol)
-         continue;
-      ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-      bool opposite = (action == "BUY" && type == POSITION_TYPE_SELL) ||
-                      (action == "SELL" && type == POSITION_TYPE_BUY);
-      if(!opposite)
-         continue;
-      count++;
-      floating_profit += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
-     }
-   return count;
-  }
-
-bool ResolveOpposingExposure(const long signal_id, const string symbol, const string action, const int leg_count)
-  {
-   double floating_profit = 0.0;
-   int opposing = CountOpposingPositions(symbol, action, floating_profit);
-   if(opposing > 0 && floating_profit > 0.0)
-     {
-      string held_action = action == "BUY" ? "SELL" : "BUY";
-      RejectSignal(signal_id, symbol, action,
-                   StringFormat("Signal %s diabaikan karena %d posisi %s masih floating profit", action, opposing, held_action),
-                   leg_count);
-      return false;
-     }
-
-   if(opposing > 0)
-     {
-      for(int i = PositionsTotal() - 1; i >= 0; i--)
-        {
-         ulong ticket = PositionGetTicket(i);
-         if(ticket == 0 || (long)PositionGetInteger(POSITION_MAGIC) != MagicNumber ||
-            PositionGetString(POSITION_SYMBOL) != symbol)
-            continue;
-         ENUM_POSITION_TYPE type = (ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
-         bool opposite = (action == "BUY" && type == POSITION_TYPE_SELL) ||
-                         (action == "SELL" && type == POSITION_TYPE_BUY);
-         if(!opposite)
-            continue;
-         if(!g_trade.PositionClose(ticket, (ulong)MaxSlippage) ||
-            (g_trade.ResultRetcode() != TRADE_RETCODE_DONE && g_trade.ResultRetcode() != TRADE_RETCODE_DONE_PARTIAL))
-            Print("[TelegramSignalEA] could not close opposing position ", ticket, ": ", g_trade.ResultRetcodeDescription());
-        }
-      floating_profit = 0.0;
-      if(CountOpposingPositions(symbol, action, floating_profit) > 0)
-        {
-         DeferSignal(signal_id, symbol, "opposing EA positions remain open; retrying before sending the new signal");
-         return false;
-        }
-     }
-
-   for(int i = OrdersTotal() - 1; i >= 0; i--)
-     {
-      ulong ticket = OrderGetTicket(i);
-      if(ticket == 0 || (long)OrderGetInteger(ORDER_MAGIC) != MagicNumber ||
-         OrderGetString(ORDER_SYMBOL) != symbol)
-         continue;
-      ENUM_ORDER_TYPE type = (ENUM_ORDER_TYPE)OrderGetInteger(ORDER_TYPE);
-      if(!IsOppositePendingOrder(type, action))
-         continue;
-      if(!g_trade.OrderDelete(ticket) || g_trade.ResultRetcode() != TRADE_RETCODE_DONE)
-        {
-         DeferSignal(signal_id, symbol, "opposing pending EA order could not be canceled; retrying");
-         return false;
-        }
      }
    return true;
   }
 
 bool ProcessOrderLeg(const long signal_id, const string symbol, const string action,
                      const string requested_type, const bool zone_order, const double requested_entry,
-                     const double sl_input, const double tp_input, const int leg, const double risk_money,
+                     const double sl_input, const double tp_input,
+                     const string rr_mode, const double fixed_sl_pips, const double fixed_tp_pips,
+                     const double reward_multiple, const int leg, const double risk_money,
                      const double bid, const double ask)
   {
    int saved_state = SavedState(signal_id, leg);
@@ -1055,6 +1022,13 @@ bool ProcessOrderLeg(const long signal_id, const string symbol, const string act
    double point = SymbolInfoDouble(symbol, SYMBOL_POINT);
    double sl = sl_input;
    double tp = tp_input;
+   string level_error = "";
+   if(!ResolveRRLevels(symbol, action, reference, sl_input, tp_input, rr_mode,
+                       fixed_sl_pips, fixed_tp_pips, reward_multiple, sl, tp, level_error))
+     {
+      ReportLegOutcome(signal_id, symbol, action, leg, "REJECTED", 0.0, level_error);
+      return false;
+     }
    if(UseDefaultSLTP && point > 0.0)
      {
       if(sl <= 0.0 && DefaultSLPoints > 0)
@@ -1069,12 +1043,6 @@ bool ProcessOrderLeg(const long signal_id, const string symbol, const string act
       ReportLegOutcome(signal_id, symbol, action, leg, "REJECTED", 0.0, "SL/TP invalid or inside broker stops level");
       return false;
      }
-   if(!CheckRewardRisk(symbol, reference, sl, tp))
-     {
-      ReportLegOutcome(signal_id, symbol, action, leg, "REJECTED", 0.0, "Jarak SL lebih besar daripada jarak TP");
-      return false;
-     }
-
    double lots = CalculateLots(symbol, action, reference, sl, risk_money);
    if(lots <= 0.0)
      {
@@ -1195,14 +1163,29 @@ void ProcessSignal(const string item)
    double sl = JsonNumber(item, "sl");
    string tp_array = JsonValue(item, "tp");
    int tp_count = ArrayNumberCount(tp_array);
-   int order_count = tp_count > 0 ? tp_count : (zone_order ? 2 : 1);
-   if(JsonValue(item, "entry_mode") == "SINGLE")
-      order_count = 1;
+   string rr_mode = JsonValue(item, "rr_mode");
+   if(rr_mode == "")
+      rr_mode = "SIGNAL";
+   double fixed_sl_pips = JsonNumber(item, "rr_fixed_sl_pips");
+   double fixed_tp_pips = JsonNumber(item, "rr_fixed_tp_pips");
+   double reward_multiple = JsonNumber(item, "rr_reward_multiple");
+   double signal_tp = 0.0;
+   for(int target_index = 0; target_index < tp_count; target_index++)
+     {
+      double target = ArrayNumberAt(tp_array, target_index);
+      if(target <= 0.0)
+         continue;
+      if(signal_tp <= 0.0 || (action == "BUY" && target > signal_tp) || (action == "SELL" && target < signal_tp))
+         signal_tp = target;
+     }
+   int order_count = zone_order && JsonValue(item, "entry_mode") != "SINGLE" ? 2 : 1;
+   double execution_tp = rr_mode == "SIGNAL" ? signal_tp : 0.0;
    string plan_error = "";
    double requested_entry = zone_order ? 0.0 : JsonNumber(item, "entry");
    if(bid > 0.0 && ask > 0.0 &&
       !ValidateSignalPlan(symbol, action, order_type, zone_order, requested_entry,
-                          entry_low, entry_high, sl, tp_array, tp_count, order_count,
+                          entry_low, entry_high, sl, execution_tp, order_count,
+                          rr_mode, fixed_sl_pips, fixed_tp_pips, reward_multiple,
                           bid, ask, plan_error))
      {
       RejectSignal(signal_id, symbol, action, plan_error, order_count);
@@ -1236,13 +1219,10 @@ void ProcessSignal(const string item)
       return;
      }
 
-   if(!ResolveOpposingExposure(signal_id, symbol, action, order_count))
-      return;
-
    for(int i = 0; i < order_count; i++)
      {
       int leg = order_count > 1 ? i + 1 : 0;
-      double tp = tp_count > 0 ? ArrayNumberAt(tp_array, i) : 0.0;
+      double tp = execution_tp;
       if(zone_order)
         {
          double leg_entry = 0.0;
@@ -1255,10 +1235,13 @@ void ProcessSignal(const string item)
          else
             leg_entry = entry_high - (entry_high - entry_low) * (double)i / (order_count - 1);
          leg_entry = NormalizePriceInRange(symbol, leg_entry, entry_low, entry_high);
-         ProcessOrderLeg(signal_id, symbol, action, "AUTO", true, leg_entry, sl, tp, leg, risk_money_per_leg, bid, ask);
+         ProcessOrderLeg(signal_id, symbol, action, "AUTO", true, leg_entry, sl, tp,
+                         rr_mode, fixed_sl_pips, fixed_tp_pips, reward_multiple,
+                         leg, risk_money_per_leg, bid, ask);
         }
       else
          ProcessOrderLeg(signal_id, symbol, action, order_type, false, JsonNumber(item, "entry"), sl, tp,
+                         rr_mode, fixed_sl_pips, fixed_tp_pips, reward_multiple,
                          leg, risk_money_per_leg, bid, ask);
      }
    g_signal_count++;
@@ -1279,7 +1262,7 @@ void SendHeartbeat()
   {
    string symbol = JsonEscape(_Symbol);
    string body = StringFormat(
-      "{\"active\":true,\"terminal\":\"%s\",\"version\":\"1.102\",\"symbol\":\"%s\"}",
+      "{\"active\":true,\"terminal\":\"%s\",\"version\":\"1.106\",\"symbol\":\"%s\"}",
       JsonEscape(TerminalInfoString(TERMINAL_NAME)), symbol);
    string response;
    HttpRequest("POST", "/api/ea/heartbeat", body, response);
@@ -1365,7 +1348,7 @@ void UpdatePanel()
   {
    int closed = g_wins + g_losses;
    double winrate = closed > 0 ? (double)g_wins / closed * 100.0 : 0.0;
-    Comment("TelegramSignalEA 1.102\n",
+    Comment("TelegramSignalEA 1.106\n",
            "Backend: ", g_connection_status, "\n",
            "Mode: LIVE\n",
            "Signals this session: ", g_signal_count, "\n",

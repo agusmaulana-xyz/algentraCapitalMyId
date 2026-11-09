@@ -28,8 +28,13 @@ func EnsureStartupSettings(ctx context.Context, pool *dbstore.Pool) error {
 	}
 	defaults := [][2]string{
 		{"confidence_threshold", "0.75"},
+		{"entry_mode", `"PARTIAL"`},
 		{"kill_switch", "false"},
 		{"max_market_deviation_pct", "5.0"},
+		{"rr_mode", `"SIGNAL"`},
+		{"rr_fixed_sl_pips", "200.0"},
+		{"rr_fixed_tp_pips", "400.0"},
+		{"rr_reward_multiple", "2.0"},
 		{"allow_updates", "false"},
 		{"registration_open", "true"},
 		{"symbol_mapping", `{"GOLD":"XAUUSD","XAU":"XAUUSD","EMAS":"XAUUSD"}`},

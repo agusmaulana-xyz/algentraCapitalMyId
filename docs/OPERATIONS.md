@@ -4,6 +4,18 @@ Panduan installasi production ada di [README](../README.md); deployment service 
 
 Admin dapat melihat dan menyalin `EA_API_KEY` pada **Settings → EA_API_KEY untuk EA master**. Nilai diambil lewat endpoint khusus yang memerlukan sesi admin dan tidak disimpan di database settings. Untuk mengganti key, ubah `EA_API_KEY` pada environment layanan lalu mulai ulang Core API; konfigurasi EA master harus memakai nilai yang sama.
 
+## Mode Risk/Reward signal Telegram
+
+Admin mengatur mode RR pada **Dashboard → Settings → Aturan sinyal**:
+
+- **Ikuti signal (TP terjauh):** memakai SL dari signal dan TP terjauh sesuai arah BUY/SELL; jarak SL boleh lebih besar daripada jarak TP.
+- **Fixed RR:** mengabaikan SL/TP signal, mempertahankan harga entry atau entry zone, lalu menghitung SL dan TP dari jarak pips yang diisi admin. TP harus minimal sejauh SL.
+- **RR dari SL signal:** mempertahankan SL signal dan mengalikan jaraknya dari harga entry dengan rasio `1 : X` untuk menghitung TP. Signal harus memiliki SL yang valid.
+
+Pip dikonversi menurut digit simbol broker: simbol 3/5 digit memakai 10 point per pip, simbol lain memakai 1 point per pip. Entry zone tetap bisa dibagi menjadi dua entry bila **Mode entry** memakai Partial. Agar pengaturan RR baru berlaku di terminal master, compile dan pasang versi terbaru `mt5/experts/TelegramSignalEA.mq5` pada chart master.
+
+Signal baru yang berlawanan arah tetap diproses tanpa menutup posisi lama atau membatalkan pending order. Akun MT5 hedging dapat menyimpan posisi BUY dan SELL bersamaan; pada akun netting, broker menggabungkan transaksi pada simbol yang sama ke posisi neto.
+
 ## Sewa server MT5
 
 Portal hanya menawarkan sewa server MT5 harian: Rp2.000 per hari dengan minimum 10 hari. Client memilih lama sewa saat membuat pesanan. Masa sewa mulai dihitung setelah pembayaran disetujui; perpanjangan menambah hari dari tanggal kedaluwarsa yang masih berlaku. Saat sewa berakhir, worker menghentikan terminal akun.

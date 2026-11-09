@@ -175,6 +175,10 @@ export function DashboardPanel() {
   const [confidenceThreshold, setConfidenceThreshold] = useState("");
   const [maxMarketDeviation, setMaxMarketDeviation] = useState("");
   const [entryMode, setEntryMode] = useState("PARTIAL");
+  const [rrMode, setRrMode] = useState("SIGNAL");
+  const [rrFixedSLPips, setRrFixedSLPips] = useState("200");
+  const [rrFixedTPPips, setRrFixedTPPips] = useState("400");
+  const [rrRewardMultiple, setRrRewardMultiple] = useState("2");
   const [symbolMapping, setSymbolMapping] = useState("");
   const [allowUpdates, setAllowUpdates] = useState(false);
   const [killSwitch, setKillSwitch] = useState(false);
@@ -262,6 +266,10 @@ export function DashboardPanel() {
     setConfidenceThreshold(String((data.confidence_threshold as number | undefined) ?? 0.75));
     setMaxMarketDeviation(String((data.max_market_deviation_pct as number | undefined) ?? 5));
     setEntryMode(String((data.entry_mode as string | undefined) ?? "PARTIAL"));
+    setRrMode(String((data.rr_mode as string | undefined) ?? "SIGNAL"));
+    setRrFixedSLPips(String((data.rr_fixed_sl_pips as number | undefined) ?? 200));
+    setRrFixedTPPips(String((data.rr_fixed_tp_pips as number | undefined) ?? 400));
+    setRrRewardMultiple(String((data.rr_reward_multiple as number | undefined) ?? 2));
     const mapping = data.symbol_mapping as Record<string, string> | undefined;
     setSymbolMapping(JSON.stringify(mapping ?? { GOLD: "XAUUSD", XAU: "XAUUSD", EMAS: "XAUUSD" }, null, 2));
     setAllowUpdates((data.allow_updates as boolean | undefined) ?? false);
@@ -563,6 +571,10 @@ export function DashboardPanel() {
         symbol_mapping: JSON.parse(symbolMapping || "{}"),
         max_market_deviation_pct: Number(maxMarketDeviation),
         entry_mode: entryMode,
+        rr_mode: rrMode,
+        rr_fixed_sl_pips: Number(rrFixedSLPips),
+        rr_fixed_tp_pips: Number(rrFixedTPPips),
+        rr_reward_multiple: Number(rrRewardMultiple),
         allow_updates: allowUpdates,
         kill_switch: killSwitch,
       };
@@ -1377,6 +1389,58 @@ export function DashboardPanel() {
                   <option value="SINGLE">Single entry</option>
                 </select>
               </label>
+              <label>
+                Mode Risk/Reward
+                <small className="field-help">Signal: SL dan TP dari sinyal, memakai target TP terjauh.</small>
+                <select id="rr-mode" value={rrMode} onChange={(event) => setRrMode(event.target.value)}>
+                  <option value="SIGNAL">Ikuti signal (TP terjauh)</option>
+                  <option value="FIXED">Fixed RR (SL/TP manual)</option>
+                  <option value="BY_SL">RR dari SL signal</option>
+                </select>
+              </label>
+              {rrMode === "FIXED" && (
+                <>
+                  <label>
+                    SL manual (pips)
+                    <small className="field-help">Jarak dari entry; ukuran pip mengikuti digit simbol di broker.</small>
+                    <input
+                      type="number"
+                      id="rr-fixed-sl-pips"
+                      min="0.1"
+                      step="0.1"
+                      value={rrFixedSLPips}
+                      onChange={(event) => setRrFixedSLPips(event.target.value)}
+                    />
+                  </label>
+                  <label>
+                    TP manual (pips)
+                    <small className="field-help">Jarak dari entry; ukuran pip mengikuti digit simbol. Minimal sama dengan jarak SL.</small>
+                    <input
+                      type="number"
+                      id="rr-fixed-tp-pips"
+                      min="0.1"
+                      step="0.1"
+                      value={rrFixedTPPips}
+                      onChange={(event) => setRrFixedTPPips(event.target.value)}
+                    />
+                  </label>
+                </>
+              )}
+              {rrMode === "BY_SL" && (
+                <label>
+                  Rasio RR (1 : X)
+                  <small className="field-help">Jarak TP dihitung dari SL signal. Contoh 1 : 2 berarti TP dua kali jarak risiko.</small>
+                  <input
+                    type="number"
+                    id="rr-reward-multiple"
+                    min="1"
+                    max="100"
+                    step="0.1"
+                    value={rrRewardMultiple}
+                    onChange={(event) => setRrRewardMultiple(event.target.value)}
+                  />
+                </label>
+              )}
               <label className="span-2">
                 Symbol mapping (JSON)
                 <small className="field-help">

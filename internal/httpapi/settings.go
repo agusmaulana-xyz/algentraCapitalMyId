@@ -2,6 +2,7 @@ package httpapi
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -85,6 +86,10 @@ func (api settingsAPI) read(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	values["entry_mode"] = defaultValue(values["entry_mode"], "PARTIAL")
+	values["rr_mode"] = defaultValue(values["rr_mode"], "SIGNAL")
+	values["rr_fixed_sl_pips"] = defaultValue(values["rr_fixed_sl_pips"], 200.0)
+	values["rr_fixed_tp_pips"] = defaultValue(values["rr_fixed_tp_pips"], 400.0)
+	values["rr_reward_multiple"] = defaultValue(values["rr_reward_multiple"], 2.0)
 	values["registration_open"] = open
 	values["gemini_configured"] = api.geminiAPIKey != ""
 	values["gemini_model"] = api.currentGeminiModel()
@@ -143,6 +148,10 @@ func (api settingsAPI) update(w http.ResponseWriter, r *http.Request) {
 		}
 		validated[key], encoded[key] = normalized, string(data)
 	}
+	if err := validateRRConsistency(ctx, api.pool, validated); err != nil {
+		writeError(w, http.StatusUnprocessableEntity, err.Error())
+		return
+	}
 	tx, err := api.pool.Begin(ctx)
 	if err != nil {
 		writeError(w, http.StatusServiceUnavailable, "Settings tidak dapat diperbarui")
@@ -179,20 +188,31 @@ func validateSetting(key string, value any) (any, error) {
 			return nil, errors.New("entry_mode harus SINGLE atau PARTIAL")
 		}
 		return mode, nil
+	case "rr_mode":
+		mode, ok := value.(string)
+		if !ok || mode != "SIGNAL" && mode != "FIXED" && mode != "BY_SL" {
+			return nil, errors.New("rr_mode harus SIGNAL, FIXED, atau BY_SL")
+		}
+		return mode, nil
 	case "allow_updates", "kill_switch", "registration_open":
 		boolean, ok := value.(bool)
 		if !ok {
 			return nil, fmt.Errorf("Setting '%s' harus boolean", key)
 		}
 		return boolean, nil
-	case "confidence_threshold", "max_market_deviation_pct":
+	case "confidence_threshold", "max_market_deviation_pct", "rr_fixed_sl_pips", "rr_fixed_tp_pips", "rr_reward_multiple":
 		number, ok := value.(float64)
 		if !ok || math.IsNaN(number) || math.IsInf(number, 0) {
 			return nil, fmt.Errorf("Setting '%s' harus angka valid", key)
 		}
 		lower, upper := 0.0, 1.0
-		if key == "max_market_deviation_pct" {
+		switch key {
+		case "max_market_deviation_pct":
 			lower, upper = 0.1, 100.0
+		case "rr_fixed_sl_pips", "rr_fixed_tp_pips":
+			lower, upper = 0.1, 100000.0
+		case "rr_reward_multiple":
+			lower, upper = 1.0, 100.0
 		}
 		if number < lower || number > upper {
 			return nil, fmt.Errorf("Setting '%s' di luar rentang %v sampai %v", key, lower, upper)
@@ -215,6 +235,43 @@ func validateSetting(key string, value any) (any, error) {
 	default:
 		return nil, fmt.Errorf("Setting '%s' tidak dapat diubah dari dashboard", key)
 	}
+}
+
+func validateRRConsistency(ctx context.Context, pool *dbstore.Pool, updated map[string]any) error {
+	sl, err := currentRRNumber(ctx, pool, "rr_fixed_sl_pips", 200)
+	if err != nil {
+		return err
+	}
+	tp, err := currentRRNumber(ctx, pool, "rr_fixed_tp_pips", 400)
+	if err != nil {
+		return err
+	}
+	if value, ok := updated["rr_fixed_sl_pips"].(float64); ok {
+		sl = value
+	}
+	if value, ok := updated["rr_fixed_tp_pips"].(float64); ok {
+		tp = value
+	}
+	if tp < sl {
+		return errors.New("TP manual harus sama dengan atau lebih jauh dari SL manual")
+	}
+	return nil
+}
+
+func currentRRNumber(ctx context.Context, pool *dbstore.Pool, key string, fallback float64) (float64, error) {
+	var raw string
+	err := pool.QueryRow(ctx, `SELECT value FROM settings WHERE key=$1`, key).Scan(&raw)
+	if errors.Is(err, sql.ErrNoRows) {
+		return fallback, nil
+	}
+	if err != nil {
+		return 0, err
+	}
+	var value float64
+	if json.Unmarshal([]byte(raw), &value) != nil || math.IsNaN(value) || math.IsInf(value, 0) || value <= 0 {
+		return fallback, nil
+	}
+	return value, nil
 }
 
 func requireAdmin(ctx context.Context, pool *dbstore.Pool, w http.ResponseWriter, r *http.Request) (string, bool) {

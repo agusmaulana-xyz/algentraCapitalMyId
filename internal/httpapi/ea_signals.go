@@ -190,6 +190,8 @@ func (api eaSignalAPI) pending(w http.ResponseWriter, r *http.Request) {
 			"raw_text": row.RawText, "action": parsed.Action, "order_type": parsed.OrderType, "symbol": symbol,
 			"entry": parsed.Entry, "entry_low": parsed.EntryLow, "entry_high": parsed.EntryHigh,
 			"sl": parsed.SL, "tp": targetValues(parsed.TP), "entry_mode": mode, "confidence": parsed.Confidence,
+			"rr_mode": responseControls["rr_mode"], "rr_fixed_sl_pips": responseControls["rr_fixed_sl_pips"],
+			"rr_fixed_tp_pips": responseControls["rr_fixed_tp_pips"], "rr_reward_multiple": responseControls["rr_reward_multiple"],
 			"created_at": wibTime(created), "created_epoch": created.Unix(),
 		})
 	}
@@ -312,12 +314,53 @@ func loadTradingControls(ctx context.Context, pool *dbstore.Pool, now time.Time)
 		return nil, false, err
 	}
 	loss := math.Max(0, -profit)
+	rrSettings, err := loadRRSettings(ctx, pool)
+	if err != nil {
+		return nil, false, err
+	}
 	controls := map[string]any{
 		"kill_switch": kill, "daily_profit": math.Round(profit*100) / 100, "daily_loss": math.Round(loss*100) / 100,
 		"open_trades": openTrades, "max_market_deviation_pct": deviation,
 		"trading_paused": kill,
 	}
+	for key, value := range rrSettings {
+		controls[key] = value
+	}
 	return controls, kill, nil
+}
+
+func loadRRSettings(ctx context.Context, pool *dbstore.Pool) (map[string]any, error) {
+	values := map[string]any{
+		"rr_mode": "SIGNAL", "rr_fixed_sl_pips": 200.0,
+		"rr_fixed_tp_pips": 400.0, "rr_reward_multiple": 2.0,
+	}
+	rows, err := pool.Query(ctx, `SELECT key,value FROM settings WHERE key IN ('rr_mode','rr_fixed_sl_pips','rr_fixed_tp_pips','rr_reward_multiple')`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var key, raw string
+		if err := rows.Scan(&key, &raw); err != nil {
+			return nil, err
+		}
+		switch key {
+		case "rr_mode":
+			var mode string
+			if json.Unmarshal([]byte(raw), &mode) == nil && (mode == "SIGNAL" || mode == "FIXED" || mode == "BY_SL") {
+				values[key] = mode
+			}
+		case "rr_fixed_sl_pips", "rr_fixed_tp_pips", "rr_reward_multiple":
+			var number float64
+			if json.Unmarshal([]byte(raw), &number) == nil && finite(number) && number > 0 {
+				values[key] = number
+			}
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return values, nil
 }
 
 func insertSystemLog(ctx context.Context, tx *dbstore.Tx, now time.Time, level, source, message string) error {
