@@ -110,12 +110,14 @@ func (api telegramAPI) processTelegramMessage(parent context.Context, message te
 	if parserPromptInjection.MatchString(promptContent) {
 		return nil
 	}
-	if !parserStructuredEnough(raw, classification) && api.parser.key == "" {
+	settings := readParserSettings(ctx, api.pool)
+	needsModel := !parserStructuredEnough(raw, classification) || classification.Confidence < settings.threshold
+	if needsModel && api.parser.key == "" {
 		if !api.parser.regexFallback {
 			return api.saveTelegramSignal(ctx, message, stamp, displayName, raw, nil, nil, nil, contentHash, "FAILED", "ERROR", "Gemini", "Parser gagal: GEMINI_API_KEY belum dikonfigurasi")
 		}
 		classification = normalizeParserEntryRange(fallbackClassification(parserPromptContent(raw, prior)), raw)
-	} else if !parserStructuredEnough(raw, classification) {
+	} else if needsModel {
 		parsed, parseErr := api.parser.gemini(ctx, raw, prior)
 		if parseErr != nil {
 			if !api.parser.regexFallback {
@@ -126,8 +128,9 @@ func (api telegramAPI) processTelegramMessage(parent context.Context, message te
 			classification = parsed
 		}
 	}
+	classification = normalizeSignalClassification(classification)
 	classification = preferFarthestTelegramTarget(classification)
-	status, symbol, normalized, reason := validateParserClassification(classification, readParserSettings(ctx, api.pool))
+	status, symbol, normalized, reason := validateParserClassification(classification, settings)
 	if status == "IGNORED" {
 		return nil
 	}
@@ -158,7 +161,8 @@ func containsString(values []string, target string) bool {
 }
 
 func isTelegramSignalCandidate(text, contextText string) bool {
-	text = strings.TrimSpace(text)
+	text = normalizeParserText(strings.TrimSpace(text))
+	contextText = normalizeParserText(contextText)
 	if text == "" || telegramResultPattern.MatchString(text) {
 		return false
 	}
@@ -168,7 +172,9 @@ func isTelegramSignalCandidate(text, contextText string) bool {
 	}
 	priceText := telegramClockPattern.ReplaceAllString(text, " ")
 	hasLevel := telegramPricePattern.MatchString(priceText)
-	if !hasLevel && !(telegramMarketNowPattern.MatchString(text) && parserSymbol.MatchString(text)) {
+	hasKnownSymbol := parserSymbol.MatchString(text) || strings.Contains(text, "الذهب")
+	marketSignal := telegramMarketNowPattern.MatchString(text) || parserMarketNow.MatchString(text)
+	if !hasLevel && !(marketSignal && hasKnownSymbol) {
 		return false
 	}
 	return direction || telegramMarkerPattern.MatchString(text)
