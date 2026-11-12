@@ -67,13 +67,26 @@ func (w *worker) probeLogin(check loginCheck) (bool, string) {
 	if err := ensureNativeBrokerServers(accountDir, w.cfg.templateDir, w.cfg.masterTerminalPath, server); err != nil {
 		return false, "Daftar server broker MT5 tidak tersedia. Pastikan terminal MT5 worker sudah memuat perusahaan/server broker ini, lalu coba lagi."
 	}
-	source := filepath.Join(w.cfg.projectRoot, "mt5", "experts", "Algentra", "MT5LoginProbe.ex5")
-	target := filepath.Join(accountDir, "MQL5", "Experts", "Algentra", "MT5LoginProbe.ex5")
-	if err := copyFile(source, target); err != nil {
+	probeSource := filepath.Join(w.cfg.projectRoot, "mt5", "experts", "Algentra", "MT5LoginProbe.mq5")
+	probeTarget := filepath.Join(accountDir, "MQL5", "Experts", "Algentra", "MT5LoginProbe.mq5")
+	if err := copyFile(probeSource, probeTarget); err != nil {
 		if isTerminalFileBusy(err) {
 			return false, terminalInUseMessage
 		}
-		return false, "Expert MT5LoginProbe.ex5 belum dikompilasi pada server."
+		return false, "Source Expert MT5LoginProbe.mq5 tidak dapat dipasang pada terminal follower."
+	}
+	// Compile the exact source installed with this worker update inside the
+	// account terminal. The template's .ex5 can be stale after an update, and
+	// .ex5 files are intentionally not tracked in the repository.
+	if err := compileCustomEA(accountDir, probeTarget); err != nil {
+		if isTerminalFileBusy(err) {
+			return false, terminalInUseMessage
+		}
+		return false, limitRunes("Expert MT5LoginProbe gagal dikompilasi pada terminal follower: "+err.Error(), 240)
+	}
+	probeBinary := strings.TrimSuffix(probeTarget, filepath.Ext(probeTarget)) + ".ex5"
+	if info, err := os.Stat(probeBinary); err != nil || info.Size() == 0 {
+		return false, "Kompilasi Expert MT5LoginProbe tidak menghasilkan file .ex5 yang valid."
 	}
 	clearSavedCharts(accountDir)
 	if err := enableAutoTrading(accountDir); err != nil {
@@ -229,7 +242,7 @@ func (w *worker) probeLogin(check loginCheck) (bool, string) {
 				return false, message
 			}
 			if authorized {
-				return false, "Login broker berhasil, tetapi Expert MT5LoginProbe tidak mengirim laporan status. Periksa kompilasi expert dan izin Algo Trading."
+				return false, "Login broker berhasil, tetapi terminal tidak menjalankan MT5LoginProbe yang sudah dikompilasi. Periksa log Experts/Journals dan izin Algo Trading."
 			}
 			if waitErr != nil {
 				return false, "Terminal MT5 berhenti sebelum laporan login diterima. Periksa log terminal dan konfigurasi startup."
@@ -239,7 +252,7 @@ func (w *worker) probeLogin(check loginCheck) (bool, string) {
 			authorized, reason := scanAuthLog(accountDir, offsets, login)
 			switch {
 			case authorized && !seen:
-				return false, "Login broker berhasil, tetapi Expert MT5LoginProbe tidak melapor. Periksa Auto Trading dan kompilasi expert."
+				return false, "Login broker berhasil, tetapi terminal tidak menjalankan MT5LoginProbe yang sudah dikompilasi. Periksa log Experts/Journals dan izin Algo Trading."
 			case reason != "":
 				message, _ := authFailureMessageForServer(reason, server)
 				return false, message
